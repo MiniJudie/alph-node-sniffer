@@ -149,6 +149,7 @@ Example: `python3 scripts/find_neighbors.py bootstrap0.alephium.org:9973`. If yo
 ## API
 
 - `GET /nodes` – Paginated list of nodes. Response: `{ "stats": { "total", "online", "offline", "dead", "last_update" }, "nodes": [ ... ] }`.  
+  Each node includes: address, port, domain, version, country, city, continent, has_api, synced, status, **reverse_dns** (PTR hostname), **hoster** (WHOIS/RDAP org, e.g. ISP or cloud provider).  
   Query: `page` (default 1), `limit` (default 50, max 1000), and filters: `continent`, `country`, `has_api`, `version`, `status`, `synced` (true/false for synced or not).
 
 ## Note

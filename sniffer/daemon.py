@@ -20,6 +20,7 @@ from sniffer.db import (
     revive_if_dead,
 )
 from sniffer.geo import geolocate
+from sniffer.lookup import reverse_dns_and_whois
 from sniffer.protocol import (
     BrokerInfo,
     build_find_node_message,
@@ -322,7 +323,8 @@ async def enrich_node(config: Config, db_path: str, address: str, port: int, *, 
                 host = resolved[0][4][0]
         except Exception:
             pass
-    country, city, continent = await geolocate(host)
+    country, city, continent, country_code, isp, org = await geolocate(host)
+    reverse_dns_name, hoster = await reverse_dns_and_whois(host)
     has_api, version = await check_rest_api(host, config.rest_port_probe)
     if version is None:
         try:
@@ -346,8 +348,13 @@ async def enrich_node(config: Config, db_path: str, address: str, port: int, *, 
         country=country,
         city=city,
         continent=continent,
+        country_code=country_code,
+        isp=isp,
+        org=org,
         has_api=has_api,
         synced=synced,
+        reverse_dns=reverse_dns_name,
+        hoster=hoster,
     )
     log_label = display_name if display_name else _display_node(host, address if address != host else None)
     logger.info("Enriched %s:%s version=%s country=%s has_api=%s synced=%s", log_label, port, version, country, has_api, synced)
@@ -396,7 +403,8 @@ async def process_and_store_node(
                 host = resolved[0][4][0]
         except Exception:
             pass
-    country, city, continent = await geolocate(host)
+    country, city, continent, country_code, isp, org = await geolocate(host)
+    reverse_dns_name, hoster = await reverse_dns_and_whois(host)
     has_api, version = await check_rest_api(host, config.rest_port_probe)
     if version is None:
         try:
@@ -422,9 +430,14 @@ async def process_and_store_node(
         country=country,
         city=city,
         continent=continent,
+        country_code=country_code,
+        isp=isp,
+        org=org,
         has_api=has_api,
         synced=synced,
         status="offline",
+        reverse_dns=reverse_dns_name,
+        hoster=hoster,
     )
     logger.info("Node %s:%s version=%s country=%s has_api=%s synced=%s", _display_node(host, info.address if info.address != host else None), port, version, country, has_api, synced)
 

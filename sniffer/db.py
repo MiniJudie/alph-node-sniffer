@@ -30,12 +30,20 @@ async def init_db(db_path: str) -> None:
                 country TEXT,
                 city TEXT,
                 continent TEXT,
+                country_code TEXT,
+                isp TEXT,
+                org TEXT,
                 has_api INTEGER NOT NULL DEFAULT 0,
                 synced INTEGER,
                 status TEXT NOT NULL DEFAULT 'offline',
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL,
                 last_explored REAL,
+                reverse_dns TEXT,
+                hoster TEXT,
+                country_code TEXT,
+                isp TEXT,
+                org TEXT,
                 UNIQUE(address, port)
             )
         """)
@@ -62,6 +70,23 @@ async def init_db(db_path: str) -> None:
             await db.execute("ALTER TABLE nodes ADD COLUMN synced INTEGER")
             await db.commit()
 
+        if "reverse_dns" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN reverse_dns TEXT")
+            await db.commit()
+        if "hoster" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN hoster TEXT")
+            await db.commit()
+
+        if "country_code" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN country_code TEXT")
+            await db.commit()
+        if "isp" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN isp TEXT")
+            await db.commit()
+        if "org" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN org TEXT")
+            await db.commit()
+
         # Indexes (after migration so columns exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_last_explored ON nodes(last_explored)")
@@ -83,12 +108,17 @@ async def upsert_node(
     country: Optional[str] = None,
     city: Optional[str] = None,
     continent: Optional[str] = None,
+    country_code: Optional[str] = None,
+    isp: Optional[str] = None,
+    org: Optional[str] = None,
     has_api: bool = False,
     synced: Optional[bool] = None,
     status: Optional[str] = None,
     first_seen: Optional[float] = None,
     last_seen: Optional[float] = None,
     last_explored: Optional[float] = None,
+    reverse_dns: Optional[str] = None,
+    hoster: Optional[str] = None,
     revive_dead: bool = False,
 ) -> None:
     """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. clique_id is hex string (66 chars)."""
@@ -106,8 +136,8 @@ async def upsert_node(
             await db.commit()
         await db.execute(
             """
-            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address, port) DO UPDATE SET
                 domain = COALESCE(excluded.domain, domain),
                 clique_id = COALESCE(excluded.clique_id, clique_id),
@@ -120,7 +150,12 @@ async def upsert_node(
                 status = excluded.status,
                 last_seen = CASE WHEN excluded.last_seen > 0 THEN excluded.last_seen ELSE nodes.last_seen END,
                 first_seen = nodes.first_seen,
-                last_explored = nodes.last_explored
+                last_explored = nodes.last_explored,
+                reverse_dns = COALESCE(excluded.reverse_dns, reverse_dns),
+                hoster = COALESCE(excluded.hoster, hoster),
+                country_code = COALESCE(excluded.country_code, country_code),
+                isp = COALESCE(excluded.isp, isp),
+                org = COALESCE(excluded.org, org)
             """,
             (
                 address,
@@ -137,6 +172,11 @@ async def upsert_node(
                 fse,
                 lse,
                 lex,
+                reverse_dns,
+                hoster,
+                country_code,
+                isp,
+                org,
             ),
         )
         await db.commit()
@@ -155,8 +195,13 @@ async def update_node_enrichment(
     continent: Optional[str] = None,
     has_api: Optional[bool] = None,
     synced: Optional[bool] = None,
+    reverse_dns: Optional[str] = None,
+    hoster: Optional[str] = None,
+    country_code: Optional[str] = None,
+    isp: Optional[str] = None,
+    org: Optional[str] = None,
 ) -> None:
-    """Update only enrichment fields (version, geo, has_api, clique_id, synced); does not change status or timestamps."""
+    """Update only enrichment fields (version, geo, has_api, clique_id, synced, reverse_dns, hoster, country_code, isp, org); does not change status or timestamps."""
     async with aiosqlite.connect(db_path) as db:
         updates = []
         params: List[Any] = []
@@ -184,6 +229,21 @@ async def update_node_enrichment(
         if synced is not None:
             updates.append("synced = ?")
             params.append(1 if synced else 0)
+        if reverse_dns is not None:
+            updates.append("reverse_dns = ?")
+            params.append(reverse_dns)
+        if hoster is not None:
+            updates.append("hoster = ?")
+            params.append(hoster)
+        if country_code is not None:
+            updates.append("country_code = ?")
+            params.append(country_code)
+        if isp is not None:
+            updates.append("isp = ?")
+            params.append(isp)
+        if org is not None:
+            updates.append("org = ?")
+            params.append(org)
         if not updates:
             return
         params.extend([address, port])
@@ -333,7 +393,7 @@ async def get_nodes(
     status: Optional[str] = None,
     synced: Optional[bool] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored FROM nodes WHERE 1=1"
+    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org FROM nodes WHERE 1=1"
     params: List[Any] = []
     if continent is not None:
         query += " AND continent = ?"
@@ -373,6 +433,11 @@ async def get_nodes(
                     "date_first_seen": row["first_seen"],
                     "date_last_seen": row["last_seen"],
                     "date_last_explored": row["last_explored"],
+                    "reverse_dns": row["reverse_dns"],
+                    "hoster": row["hoster"],
+                    "country_code": row["country_code"],
+                    "isp": row["isp"],
+                    "org": row["org"],
                 }
 
 
@@ -457,7 +522,7 @@ async def get_nodes_paginated(
         offset = max(0, (page - 1) * limit)
         limit_val = max(1, min(limit, 1000))
         list_query = f"""
-            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored
+            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org
             FROM nodes WHERE {where}
             ORDER BY last_seen DESC
             LIMIT ? OFFSET ?
@@ -482,6 +547,11 @@ async def get_nodes_paginated(
                 "date_first_seen": row["first_seen"],
                 "date_last_seen": row["last_seen"],
                 "date_last_explored": row["last_explored"],
+                "reverse_dns": row["reverse_dns"],
+                "hoster": row["hoster"],
+                "country_code": row["country_code"],
+                "isp": row["isp"],
+                "org": row["org"],
             })
     return {
         "stats": {
