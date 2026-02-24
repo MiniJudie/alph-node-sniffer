@@ -17,7 +17,12 @@ logging.basicConfig(
     stream=sys.stdout,
 )
 if os.environ.get("SNIFFER_NETWORK_DEBUG"):
-    for name in ("httpx", "httpcore", "aiosqlite", "uvicorn", "uvicorn.error", "uvicorn.access"):
+    for name in (
+        "httpx", "httpcore", "aiosqlite",
+        "uvicorn", "uvicorn.error", "uvicorn.access", "uvicorn.default",
+        "asyncio",
+        "sniffer.version_check", "sniffer.geo",
+    ):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 

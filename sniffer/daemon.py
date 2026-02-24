@@ -418,7 +418,8 @@ def _run_api_server(config: Config) -> None:
     import uvicorn
     from sniffer.api import create_app
     app = create_app(config, config.database_path)
-    uvicorn.run(app, host=config.http_host, port=config.http_port, log_level="info")
+    log_level = "warning" if os.environ.get("SNIFFER_NETWORK_DEBUG") else "info"
+    uvicorn.run(app, host=config.http_host, port=config.http_port, log_level=log_level)
 
 
 async def run_daemon(config: Config) -> None:
