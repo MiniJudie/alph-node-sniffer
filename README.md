@@ -65,6 +65,31 @@ python3 -m sniffer ping 1.2.3.4:9973 --network-id 1 --timeout 10
 - Discovery proxy: UDP on `bind_address` (default 0.0.0.0:9973).
 - Explorer API: http://localhost:9090 (Swagger at http://localhost:9090/docs).
 
+## systemd (optional)
+
+To run the daemon as a system service with automatic restart on crash:
+
+1. Copy the template and set your project path and user (e.g. your own user instead of `sniffer`):
+   ```bash
+   sudo cp alephium-node-sniffer.service /etc/systemd/system/
+   sudo sed -i 's|/path/to/alph-node-sniffer|/home/you/alph-node-sniffer|g' /etc/systemd/system/alephium-node-sniffer.service
+   ```
+   Edit `/etc/systemd/system/alephium-node-sniffer.service` to set `User=` and `Group=` (e.g. your user) and ensure `ExecStart` uses your venv path or `/usr/bin/python3 -m sniffer daemon` if not using a venv.
+
+2. Reload systemd, enable and start the service:
+   ```bash
+   sudo systemctl daemon-reload
+   sudo systemctl enable --now alephium-node-sniffer
+   ```
+
+3. Check status and logs:
+   ```bash
+   sudo systemctl status alephium-node-sniffer
+   journalctl -u alephium-node-sniffer -f
+   ```
+
+The unit uses `Restart=on-failure` and `RestartSec=10` so the process is restarted automatically when it exits unsuccessfully.
+
 ## UDP discovery vs TCP broker (real nodes)
 
 A full Alephium node uses **two separate channels**:
@@ -123,10 +148,8 @@ Example: `python3 scripts/find_neighbors.py bootstrap0.alephium.org:9973`. If yo
 
 ## API
 
-- `GET /reference-nodes` – reference nodes used.
-- `GET /stats` – total discovered, online, offline.
-- `GET /versions` – all node versions with counts.
-- `GET /nodes` – list nodes (query: `continent`, `country`, `has_api`, `version`).
+- `GET /nodes` – Paginated list of nodes. Response: `{ "stats": { "total", "online", "offline", "dead", "last_update" }, "nodes": [ ... ] }`.  
+  Query: `page` (default 1), `limit` (default 50, max 1000), and filters: `continent`, `country`, `has_api`, `version`, `status`, `synced` (true/false for synced or not).
 
 ## Note
 

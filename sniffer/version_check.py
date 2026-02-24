@@ -24,8 +24,11 @@ async def _try_port(host: str, port: int, timeout: float) -> Tuple[bool, Optiona
                 return (False, None)
             data = r.json()
             version = data.get("releaseVersion") or data.get("version")
-            if version:
-                return (True, str(version))
+            if version is not None:
+                if isinstance(version, dict):
+                    version = version.get("releaseVersion") or version.get("version")
+                if isinstance(version, str) and version.strip():
+                    return (True, version.strip())
             return (True, None)
     except Exception as e:
         logger.debug("check_rest %s:%s %s", host, port, e)
@@ -68,3 +71,39 @@ async def get_client_version_tcp(
         None,
         lambda: fetch_client_version_tcp(host, broker_port, network_id, timeout),
     )
+
+
+async def check_synced(
+    host: str,
+    port: int,
+    timeout: float = 3.0,
+) -> Optional[bool]:
+    """
+    Check if node reports itself as synced via REST.
+    Tries GET /infos/self-clique-synced (returns boolean), then GET /infos/self-clique (read .synced).
+    Tries port, then 80, then 443 (same order as check_rest_api).
+    Returns True/False if known, None if no API or error.
+    """
+    ports_to_try = [port]
+    if 80 not in ports_to_try:
+        ports_to_try.append(80)
+    if 443 not in ports_to_try:
+        ports_to_try.append(443)
+    for p in ports_to_try:
+        scheme = "https" if p == 443 else "http"
+        base = f"{scheme}://{host}" if p in (80, 443) else f"{scheme}://{host}:{p}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(f"{base}/infos/self-clique-synced")
+                if r.status_code == 200:
+                    data = r.json()
+                    if isinstance(data, bool):
+                        return data
+                r2 = await client.get(f"{base}/infos/self-clique")
+                if r2.status_code == 200:
+                    data = r2.json()
+                    if isinstance(data, dict) and "synced" in data:
+                        return bool(data["synced"])
+        except Exception as e:
+            logger.debug("check_synced %s:%s %s", host, p, e)
+    return None

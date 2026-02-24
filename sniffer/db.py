@@ -2,6 +2,7 @@
 import aiosqlite
 import logging
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, AsyncIterator, List, Optional
 
@@ -30,6 +31,7 @@ async def init_db(db_path: str) -> None:
                 city TEXT,
                 continent TEXT,
                 has_api INTEGER NOT NULL DEFAULT 0,
+                synced INTEGER,
                 status TEXT NOT NULL DEFAULT 'offline',
                 first_seen REAL NOT NULL,
                 last_seen REAL NOT NULL,
@@ -56,6 +58,9 @@ async def init_db(db_path: str) -> None:
         if "clique_id" not in cols:
             await db.execute("ALTER TABLE nodes ADD COLUMN clique_id TEXT")
             await db.commit()
+        if "synced" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN synced INTEGER")
+            await db.commit()
 
         # Indexes (after migration so columns exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
@@ -63,6 +68,7 @@ async def init_db(db_path: str) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_country ON nodes(country)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_version ON nodes(version)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_has_api ON nodes(has_api)")
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_synced ON nodes(synced)")
         await db.commit()
 
 
@@ -78,6 +84,7 @@ async def upsert_node(
     city: Optional[str] = None,
     continent: Optional[str] = None,
     has_api: bool = False,
+    synced: Optional[bool] = None,
     status: Optional[str] = None,
     first_seen: Optional[float] = None,
     last_seen: Optional[float] = None,
@@ -99,8 +106,8 @@ async def upsert_node(
             await db.commit()
         await db.execute(
             """
-            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address, port) DO UPDATE SET
                 domain = COALESCE(excluded.domain, domain),
                 clique_id = COALESCE(excluded.clique_id, clique_id),
@@ -109,6 +116,7 @@ async def upsert_node(
                 city = COALESCE(excluded.city, city),
                 continent = COALESCE(excluded.continent, continent),
                 has_api = excluded.has_api OR has_api,
+                synced = COALESCE(excluded.synced, synced),
                 status = excluded.status,
                 last_seen = CASE WHEN excluded.last_seen > 0 THEN excluded.last_seen ELSE nodes.last_seen END,
                 first_seen = nodes.first_seen,
@@ -124,6 +132,7 @@ async def upsert_node(
                 city,
                 continent,
                 1 if has_api else 0,
+                (1 if synced is True else (0 if synced is False else None)),
                 st,
                 fse,
                 lse,
@@ -145,8 +154,9 @@ async def update_node_enrichment(
     city: Optional[str] = None,
     continent: Optional[str] = None,
     has_api: Optional[bool] = None,
+    synced: Optional[bool] = None,
 ) -> None:
-    """Update only enrichment fields (version, geo, has_api, clique_id); does not change status or timestamps."""
+    """Update only enrichment fields (version, geo, has_api, clique_id, synced); does not change status or timestamps."""
     async with aiosqlite.connect(db_path) as db:
         updates = []
         params: List[Any] = []
@@ -171,6 +181,9 @@ async def update_node_enrichment(
         if has_api is not None:
             updates.append("has_api = ?")
             params.append(1 if has_api else 0)
+        if synced is not None:
+            updates.append("synced = ?")
+            params.append(1 if synced else 0)
         if not updates:
             return
         params.extend([address, port])
@@ -235,6 +248,22 @@ async def get_nodes_to_explore(db_path: str, limit: int = 1) -> List[tuple]:
     return [(r[0], r[1], r[2]) for r in rows]
 
 
+async def get_nodes_without_version(db_path: str, limit: int = 50) -> List[tuple]:
+    """Return (address, port, domain) of nodes that have no version yet (for retry enrichment). status in (online, offline)."""
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            """
+            SELECT address, port, domain FROM nodes
+            WHERE (version IS NULL OR version = '') AND status IN (?, ?)
+            ORDER BY last_seen DESC
+            LIMIT ?
+            """,
+            (STATUS_ONLINE, STATUS_OFFLINE, limit),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [(r[0], r[1], r[2]) for r in rows]
+
+
 async def revive_if_dead(db_path: str, address: str, port: int) -> bool:
     """If node is dead, set status=offline so it gets explored again. Returns True if was dead and revived."""
     async with aiosqlite.connect(db_path) as db:
@@ -265,11 +294,18 @@ async def get_stats(db_path: str) -> dict[str, Any]:
                 offline = row["cnt"]
             elif row["status"] == STATUS_DEAD:
                 dead = row["cnt"]
+        async with db.execute(
+            "SELECT MAX(COALESCE(last_explored, 0)), MAX(COALESCE(last_seen, 0)) FROM nodes"
+        ) as cur:
+            row = await cur.fetchone()
+        last_ts = max((row[0] or 0.0), (row[1] or 0.0)) if row else 0.0
+        last_update = datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat() if last_ts else None
         return {
             "total_discovered": total,
             "online": online,
             "offline": offline,
             "dead": dead,
+            "last_update": last_update,
         }
 
 
@@ -295,8 +331,9 @@ async def get_nodes(
     has_api: Optional[bool] = None,
     version: Optional[str] = None,
     status: Optional[str] = None,
+    synced: Optional[bool] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored FROM nodes WHERE 1=1"
+    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored FROM nodes WHERE 1=1"
     params: List[Any] = []
     if continent is not None:
         query += " AND continent = ?"
@@ -313,6 +350,9 @@ async def get_nodes(
     if status is not None:
         query += " AND status = ?"
         params.append(status)
+    if synced is not None:
+        query += " AND synced = ?"
+        params.append(1 if synced else 0)
     query += " ORDER BY last_seen DESC"
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -328,8 +368,128 @@ async def get_nodes(
                     "city": row["city"],
                     "continent": row["continent"],
                     "has_api": bool(row["has_api"]),
+                    "synced": None if row["synced"] is None else bool(row["synced"]),
                     "status": row["status"],
                     "date_first_seen": row["first_seen"],
                     "date_last_seen": row["last_seen"],
                     "date_last_explored": row["last_explored"],
                 }
+
+
+def _nodes_where_clause(
+    continent: Optional[str] = None,
+    country: Optional[str] = None,
+    has_api: Optional[bool] = None,
+    version: Optional[str] = None,
+    status: Optional[str] = None,
+    synced: Optional[bool] = None,
+) -> tuple[str, List[Any]]:
+    """Build WHERE clause and params for nodes list (shared by stats and paginated list)."""
+    where = "1=1"
+    params: List[Any] = []
+    if continent is not None:
+        where += " AND continent = ?"
+        params.append(continent)
+    if country is not None:
+        where += " AND country = ?"
+        params.append(country)
+    if has_api is not None:
+        where += " AND has_api = ?"
+        params.append(1 if has_api else 0)
+    if version is not None:
+        where += " AND version = ?"
+        params.append(version)
+    if status is not None:
+        where += " AND status = ?"
+        params.append(status)
+    if synced is not None:
+        where += " AND synced = ?"
+        params.append(1 if synced else 0)
+    return where, params
+
+
+async def get_nodes_paginated(
+    db_path: str,
+    *,
+    continent: Optional[str] = None,
+    country: Optional[str] = None,
+    has_api: Optional[bool] = None,
+    version: Optional[str] = None,
+    status: Optional[str] = None,
+    synced: Optional[bool] = None,
+    page: int = 1,
+    limit: int = 50,
+) -> dict[str, Any]:
+    """Return { stats: { total, online, offline, dead, last_update }, nodes: [...] } with paging. Stats apply to filtered set."""
+    where, params = _nodes_where_clause(
+        continent=continent,
+        country=country,
+        has_api=has_api,
+        version=version,
+        status=status,
+        synced=synced,
+    )
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        # Stats: total and breakdown by status (on filtered set)
+        stats_query = f"""
+            SELECT COUNT(*) AS total,
+                   SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS online,
+                   SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS offline,
+                   SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS dead
+            FROM nodes WHERE {where}
+        """
+        stats_params = [STATUS_ONLINE, STATUS_OFFLINE, STATUS_DEAD] + params
+        async with db.execute(stats_query, stats_params) as cur:
+            row = await cur.fetchone()
+        total = row[0] or 0
+        online = row[1] or 0
+        offline = row[2] or 0
+        dead = row[3] or 0
+        # last_update: max of last_explored/last_seen (global, not filtered)
+        async with db.execute(
+            "SELECT MAX(COALESCE(last_explored, 0)), MAX(COALESCE(last_seen, 0)) FROM nodes"
+        ) as cur:
+            r = await cur.fetchone()
+        last_ts = max((r[0] or 0.0), (r[1] or 0.0)) if r else 0.0
+        last_update = datetime.fromtimestamp(last_ts, tz=timezone.utc).isoformat() if last_ts else None
+        # Paginated nodes
+        offset = max(0, (page - 1) * limit)
+        limit_val = max(1, min(limit, 1000))
+        list_query = f"""
+            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored
+            FROM nodes WHERE {where}
+            ORDER BY last_seen DESC
+            LIMIT ? OFFSET ?
+        """
+        list_params = params + [limit_val, offset]
+        async with db.execute(list_query, list_params) as cur:
+            rows = await cur.fetchall()
+        nodes = []
+        for row in rows:
+            nodes.append({
+                "address": row["address"],
+                "port": row["port"],
+                "domain": row["domain"],
+                "clique_id": row["clique_id"],
+                "version": row["version"],
+                "country": row["country"],
+                "city": row["city"],
+                "continent": row["continent"],
+                "has_api": bool(row["has_api"]),
+                "synced": None if row["synced"] is None else bool(row["synced"]),
+                "status": row["status"],
+                "date_first_seen": row["first_seen"],
+                "date_last_seen": row["last_seen"],
+                "date_last_explored": row["last_explored"],
+            })
+    return {
+        "stats": {
+            "total": total,
+            "online": int(online),
+            "offline": int(offline),
+            "dead": int(dead),
+            "last_update": last_update,
+        },
+        "nodes": nodes,
+    }

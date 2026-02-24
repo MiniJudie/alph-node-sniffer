@@ -16,6 +16,7 @@ from sniffer.db import (
     mark_exploration_success,
     mark_exploration_failed,
     get_nodes_to_explore,
+    get_nodes_without_version,
     revive_if_dead,
 )
 from sniffer.geo import geolocate
@@ -28,7 +29,7 @@ from sniffer.protocol import (
     get_response_payload_type,
     magic_bytes,
 )
-from sniffer.version_check import check_rest_api, get_client_version_tcp
+from sniffer.version_check import check_rest_api, check_synced, get_client_version_tcp
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +331,12 @@ async def enrich_node(config: Config, db_path: str, address: str, port: int, *, 
             )
         except Exception:
             pass
+    synced: Optional[bool] = None
+    if has_api:
+        try:
+            synced = await check_synced(host, config.rest_port_probe, timeout=5.0)
+        except Exception:
+            pass
     await update_node_enrichment(
         db_path,
         host,
@@ -340,9 +347,10 @@ async def enrich_node(config: Config, db_path: str, address: str, port: int, *, 
         city=city,
         continent=continent,
         has_api=has_api,
+        synced=synced,
     )
     log_label = display_name if display_name else _display_node(host, address if address != host else None)
-    logger.info("Enriched %s:%s version=%s country=%s has_api=%s", log_label, port, version, country, has_api)
+    logger.info("Enriched %s:%s version=%s country=%s has_api=%s synced=%s", log_label, port, version, country, has_api, synced)
 
 
 async def ensure_node_in_db(db_path: str, address: str, port: int, from_neighbors: bool = True) -> None:
@@ -397,6 +405,12 @@ async def process_and_store_node(
             )
         except Exception:
             pass
+    synced: Optional[bool] = None
+    if has_api:
+        try:
+            synced = await check_synced(host, config.rest_port_probe, timeout=5.0)
+        except Exception:
+            pass
     clique_id_hex = info.clique_id.hex() if info.clique_id else None
     await upsert_node(
         db_path,
@@ -409,9 +423,10 @@ async def process_and_store_node(
         city=city,
         continent=continent,
         has_api=has_api,
+        synced=synced,
         status="offline",
     )
-    logger.info("Node %s:%s version=%s country=%s has_api=%s", _display_node(host, info.address if info.address != host else None), port, version, country, has_api)
+    logger.info("Node %s:%s version=%s country=%s has_api=%s synced=%s", _display_node(host, info.address if info.address != host else None), port, version, country, has_api, synced)
 
 
 # Delay between each FindNode in a cycle (seconds) to avoid flooding
@@ -526,6 +541,14 @@ async def discovery_loop(config: Config, db_path: str, proxy: Optional["UDPProxy
                 asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
 
             await asyncio.sleep(FINDNODE_DELAY_SEC)
+
+        # Retry enrichment for nodes that still have no version (REST or TCP may have failed earlier)
+        without_version = await get_nodes_without_version(db_path, limit=30)
+        if without_version:
+            logger.info("Re-enriching %d nodes without version", len(without_version))
+            for host, port, domain in without_version:
+                display = _display_node(host, domain)
+                asyncio.create_task(enrich_node(config, db_path, host, port, display_name=display))
 
         logger.info("Discovery cycle done (%d nodes). Restarting from start in %s s.", len(candidates), config.scan_interval_seconds)
         await asyncio.sleep(config.scan_interval_seconds)
