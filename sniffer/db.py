@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
 STATUS_DEAD = "dead"
-OFFLINE_THRESHOLD_SEC = 30 * 60   # 30 minutes without response
+OFFLINE_THRESHOLD_SEC = 60 * 60   # 30 minutes without response
 DEAD_THRESHOLD_SEC = 48 * 3600    # 48 hours without response
 
 
