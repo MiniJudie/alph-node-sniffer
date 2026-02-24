@@ -169,28 +169,49 @@ def _discover_node_sync(
     Blocking: Ping then FindNode on the same socket so the node sees us before FindNode.
     Returns raw Neighbors response bytes or None. Run via run_in_executor.
     """
+    network_debug = bool(os.environ.get("SNIFFER_NETWORK_DEBUG"))
     ping_timeout = min(3.0, timeout / 2)
     find_timeout = timeout - ping_timeout
     if find_timeout < 1.0:
         find_timeout = timeout
         ping_timeout = 0
+    sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(ping_timeout)
         ping_msg = build_ping_message(network_id, os.urandom(32))
         find_msg = build_find_node_message(network_id, os.urandom(32))
         sock.sendto(ping_msg, (host, port))
+        if network_debug:
+            logger.debug("DISCOVERY SEND to %s:%s [%s] %d bytes", host, port, describe_discovery_message(ping_msg, network_id), len(ping_msg))
         try:
-            sock.recvfrom(65535)
+            first, from_addr = sock.recvfrom(65535)
+            if network_debug:
+                logger.debug("DISCOVERY RECV from %s:%s [%s] %d bytes", from_addr[0], from_addr[1], describe_discovery_message(first, network_id), len(first))
         except socket.timeout:
-            pass
+            if network_debug:
+                logger.debug("DISCOVERY RECV from %s:%s (Pong timeout)", host, port)
         sock.settimeout(find_timeout)
         sock.sendto(find_msg, (host, port))
-        resp, _ = sock.recvfrom(65535)
-        sock.close()
+        if network_debug:
+            logger.debug("DISCOVERY SEND to %s:%s [%s] %d bytes", host, port, describe_discovery_message(find_msg, network_id), len(find_msg))
+        try:
+            resp, from_addr = sock.recvfrom(65535)
+        except socket.timeout:
+            if network_debug:
+                logger.debug("DISCOVERY RECV from %s:%s (Neighbors timeout)", host, port)
+            return None
+        if network_debug:
+            logger.debug("DISCOVERY RECV from %s:%s [%s] %d bytes", from_addr[0], from_addr[1], describe_discovery_message(resp, network_id), len(resp))
         return resp
-    except (socket.timeout, OSError):
+    except OSError:
         return None
+    finally:
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
 
 
 async def _discover_node(

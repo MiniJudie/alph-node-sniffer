@@ -67,17 +67,21 @@ SNIFFER_DEBUG=1 python3 -m sniffer daemon
 
 This turns on DEBUG logging for the sniffer and prints extra lines when probing nodes (e.g. raw reply size and magic bytes when a response is received, or a hint when no reply is received).
 
-To log **every UDP packet on port 9973** (all discovery messages received and sent by the proxy), set `SNIFFER_NETWORK_DEBUG`:
+To log **every UDP packet on port 9973** (all discovery messages received and sent by the proxy) and **every discovery Ping/FindNode** sent and received, set `SNIFFER_NETWORK_DEBUG`:
 
 ```bash
 SNIFFER_NETWORK_DEBUG=1 python3 -m sniffer daemon
 ```
 
-You will see lines like:
-- `UDP 9973 RECV from 1.2.3.4:56789 [Ping] 99 bytes`
-- `UDP 9973 SEND to ref.node:9973 [Ping] 99 bytes`
-- `UDP 9973 RECV from ref.node:9973 [Pong] 200 bytes`
-- `UDP 9973 SEND to 1.2.3.4:56789 [Pong] 200 bytes`
+You will see:
+- **UDP 9973 RECV/SEND** – traffic on the proxy socket (port 9973), i.e. when another node talks to your sniffer or the proxy relays to a reference node. If no one sends to your 9973, there will be no lines.
+- **DISCOVERY SEND/RECV** – Ping and FindNode traffic to bootstrap/peers (outbound from an ephemeral port). Use this to confirm that discovery packets are sent and whether Pong/Neighbors replies are received or timeout.
+
+Example:
+- `DISCOVERY SEND to bootstrap0.alephium.org:9973 [Ping] 99 bytes`
+- `DISCOVERY RECV from 3.14.19.103:9973 (Pong timeout)` or `[Pong] 184 bytes`
+- `DISCOVERY SEND to bootstrap0.alephium.org:9973 [FindNode] 98 bytes`
+- `DISCOVERY RECV from 3.14.19.103:9973 [Neighbors (5 peers)] 200 bytes` or `(Neighbors timeout)`
 
 (DEBUG level is enabled automatically when either `SNIFFER_DEBUG` or `SNIFFER_NETWORK_DEBUG` is set.)
 
