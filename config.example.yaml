@@ -1,0 +1,38 @@
+# Alephium Node Sniffer / Proxy configuration
+# Copy to config.yaml and adjust
+
+# Network to target: mainnet (0) or testnet (1)
+network_id: 0
+
+# Bind address for the discovery UDP proxy (emulated node)
+bind_address: "0.0.0.0:9973"
+
+# HTTP API bind for the explorer REST + Swagger
+http_host: "0.0.0.0"
+http_port: 9090
+
+# Starting nodes: first list we try to connect to and discover from
+starting_nodes:
+  - "bootstrap0.alephium.org:9973"
+  - "bootstrap1.alephium.org:9973"
+  - "bootstrap2.alephium.org:9973"
+  - "bootstrap3.alephium.org:9973"
+  - "bootstrap4.alephium.org:9973"
+  - "bootstrap5.alephium.org:9973"
+
+# Reference nodes: used to relay incoming requests and get responses (same as bootstrap for mainnet)
+reference_nodes:
+  - "vir01.eu.node.mainnet.alphscan.io:9973"
+  - "gra01.eu.node.mainnet.alphscan.io:9973"  
+
+# Path to SQLite database
+database_path: "nodes.db"
+
+# Common REST API port to probe for node version (Alephium default)
+rest_port_probe: 12973
+
+# Scan interval in seconds (how often to ask for more neighbors)
+scan_interval_seconds: 300
+
+# Timeout for UDP discovery requests (seconds)
+udp_timeout_seconds: 25
