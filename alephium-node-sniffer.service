@@ -1,0 +1,40 @@
+# Alephium Node Sniffer / Proxy – systemd service template
+# Copy to /etc/systemd/system/ and edit paths and user.
+#
+#   sudo cp alephium-node-sniffer.service /etc/systemd/system/
+#   sudo sed -i 's|/path/to/alph-node-sniffer|/home/you/alph-node-sniffer|g' /etc/systemd/system/alephium-node-sniffer.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now alephium-node-sniffer
+#
+# Optional: set SNIFFER_DEBUG=1 or SNIFFER_NETWORK_DEBUG=1 in [Service] Environment=
+
+[Unit]
+Description=Alephium Node Sniffer (discovery proxy + API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sniffer
+Group=sniffer
+WorkingDirectory=/path/to/alph-node-sniffer
+
+# Use venv Python if present, else system python3
+ExecStart=/path/to/alph-node-sniffer/.venv/bin/python -m sniffer daemon
+# If not using a venv, use:
+# ExecStart=/usr/bin/python3 -m sniffer daemon
+
+# Config is config.yaml in WorkingDirectory by default. For a custom path add: -c /path/to/config.yaml
+
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=alephium-node-sniffer
+
+# Optional: limit restarts in a short window
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Install]
+WantedBy=multi-user.target
