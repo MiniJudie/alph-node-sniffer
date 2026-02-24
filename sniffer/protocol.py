@@ -212,6 +212,31 @@ def get_response_payload_type(raw: bytes, network_id: int) -> Tuple[Optional[int
         return (None, None)
 
 
+# Payload type names for logging
+_PAYLOAD_NAMES = {0: "Ping", 1: "Pong", 2: "FindNode", 3: "Neighbors"}
+
+
+def describe_discovery_message(raw: bytes, network_id: int, max_hex: int = 32) -> str:
+    """Return a short description for logging: e.g. 'Ping', 'Neighbors (5)', or '? 142 bytes' + hex prefix."""
+    payload_type, payload = get_response_payload_type(raw, network_id)
+    if payload_type is not None:
+        name = _PAYLOAD_NAMES.get(payload_type, f"type{payload_type}")
+        if payload_type == CODE_NEIGHBORS and payload:
+            try:
+                count = decode_compact_int(payload)[0]
+                if count >= 0:
+                    return f"{name} ({count} peers)"
+            except (ValueError, IndexError):
+                pass
+        return name
+    if not raw:
+        return "empty"
+    hex_prefix = raw[:max_hex].hex()
+    if len(raw) > max_hex:
+        hex_prefix += "..."
+    return f"? {len(raw)} bytes hex={hex_prefix}"
+
+
 def extract_neighbors_from_message(raw: bytes, network_id: int) -> List[BrokerInfo]:
     """If raw is a Neighbors message, return list of BrokerInfo; else empty."""
     magic = magic_bytes(network_id)

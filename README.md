@@ -43,7 +43,8 @@ pip install -r requirements.txt
 Copy `config.example.yaml` to `config.yaml` and edit if needed (or the daemon will use the example config).
 
 ```bash
-# With venv activated (see Setup)
+# Activate the venv and install deps first (see Setup) if you haven't yet
+source .venv/bin/activate
 python3 -m sniffer daemon
 ```
 
@@ -65,6 +66,20 @@ SNIFFER_DEBUG=1 python3 -m sniffer daemon
 ```
 
 This turns on DEBUG logging for the sniffer and prints extra lines when probing nodes (e.g. raw reply size and magic bytes when a response is received, or a hint when no reply is received).
+
+To log **every UDP packet on port 9973** (all discovery messages received and sent by the proxy), set `SNIFFER_NETWORK_DEBUG`:
+
+```bash
+SNIFFER_NETWORK_DEBUG=1 python3 -m sniffer daemon
+```
+
+You will see lines like:
+- `UDP 9973 RECV from 1.2.3.4:56789 [Ping] 99 bytes`
+- `UDP 9973 SEND to ref.node:9973 [Ping] 99 bytes`
+- `UDP 9973 RECV from ref.node:9973 [Pong] 200 bytes`
+- `UDP 9973 SEND to 1.2.3.4:56789 [Pong] 200 bytes`
+
+(DEBUG level is enabled automatically when either `SNIFFER_DEBUG` or `SNIFFER_NETWORK_DEBUG` is set.)
 
 ## API
 

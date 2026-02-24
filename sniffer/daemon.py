@@ -23,6 +23,7 @@ from sniffer.protocol import (
     BrokerInfo,
     build_find_node_message,
     build_ping_message,
+    describe_discovery_message,
     extract_neighbors_from_message,
     get_response_payload_type,
     magic_bytes,
@@ -67,6 +68,7 @@ class UDPProxy:
         self._ref_nodes: List[Tuple[str, int]] = []
         self._magic = magic_bytes(config.network_id)
         self._pending: Optional[Tuple[Tuple[str, int], Tuple[str, int], bytes]] = None  # (client_addr, ref_addr, request_data)
+        self._network_debug = bool(os.environ.get("SNIFFER_NETWORK_DEBUG"))
 
     def _get_ref_nodes(self) -> List[Tuple[str, int]]:
         if not self._ref_nodes:
@@ -98,6 +100,9 @@ class UDPProxy:
             return False
         if not data:
             return False
+        if self._network_debug:
+            desc = describe_discovery_message(data, self.config.network_id)
+            logger.debug("UDP 9973 RECV from %s:%s [%s] %d bytes", addr[0], addr[1], desc, len(data))
         refs = self._get_ref_nodes()
         if not refs:
             return True
@@ -105,12 +110,21 @@ class UDPProxy:
             ref = random.choice(refs)
             ref_addr = (ref[0], ref[1])
             self.sock.sendto(data, ref_addr)
+            if self._network_debug:
+                desc = describe_discovery_message(data, self.config.network_id)
+                logger.debug("UDP 9973 SEND to %s:%s [%s] %d bytes", ref_addr[0], ref_addr[1], desc, len(data))
             self._pending = (addr, ref_addr, data)
             logger.info("Relay request from %s -> %s:%s (waiting response)", addr, ref[0], ref[1])
             return True
         client_addr, ref_addr, _ = self._pending
         if addr[0] == ref_addr[0] and addr[1] == ref_addr[1]:
+            if self._network_debug:
+                desc = describe_discovery_message(data, self.config.network_id)
+                logger.debug("UDP 9973 RECV from %s:%s [%s] %d bytes", ref_addr[0], ref_addr[1], desc, len(data))
             self.sock.sendto(data, client_addr)
+            if self._network_debug:
+                desc = describe_discovery_message(data, self.config.network_id)
+                logger.debug("UDP 9973 SEND to %s:%s [%s] %d bytes", client_addr[0], client_addr[1], desc, len(data))
             logger.info("Relay response from %s:%s -> %s", ref_addr[0], ref_addr[1], client_addr)
             self._pending = None
         return True

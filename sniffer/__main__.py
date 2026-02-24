@@ -11,7 +11,7 @@ from sniffer.daemon import run_daemon
 from sniffer.db import init_db
 
 logging.basicConfig(
-    level=logging.DEBUG if os.environ.get("SNIFFER_DEBUG") else logging.INFO,
+    level=logging.DEBUG if (os.environ.get("SNIFFER_DEBUG") or os.environ.get("SNIFFER_NETWORK_DEBUG")) else logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
