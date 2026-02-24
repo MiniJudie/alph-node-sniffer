@@ -69,6 +69,7 @@ class UDPProxy:
         self._magic = magic_bytes(config.network_id)
         self._pending: Optional[Tuple[Tuple[str, int], Tuple[str, int], bytes]] = None  # (client_addr, ref_addr, request_data)
         self._network_debug = bool(os.environ.get("SNIFFER_NETWORK_DEBUG"))
+        self._discovery_pending: Optional[Tuple[Tuple[str, int], asyncio.Future]] = None  # (target_addr, future) when waiting for discovery response
 
     def _get_ref_nodes(self) -> List[Tuple[str, int]]:
         if not self._ref_nodes:
@@ -90,6 +91,24 @@ class UDPProxy:
             self.sock.close()
             self.sock = None
 
+    async def send_discovery_and_wait(
+        self, data: bytes, target: Tuple[str, int], timeout: float
+    ) -> Optional[bytes]:
+        """Send discovery packet from proxy socket (port 9973) and wait for response. Returns response bytes or None on timeout."""
+        if not self.sock:
+            return None
+        future: asyncio.Future[bytes] = self.loop.create_future()
+        self._discovery_pending = (target, future)
+        try:
+            self.sock.sendto(data, target)
+            if self._network_debug:
+                logger.debug("UDP 9973 SEND (discovery) to %s:%s [%s] %d bytes", target[0], target[1], describe_discovery_message(data, self.config.network_id), len(data))
+            return await asyncio.wait_for(future, timeout=timeout)
+        except asyncio.TimeoutError:
+            return None
+        finally:
+            self._discovery_pending = None
+
     async def relay_once(self) -> bool:
         """Read one datagram; if no pending, relay to ref and wait for response; else if from ref, send to client."""
         if not self.sock:
@@ -100,6 +119,13 @@ class UDPProxy:
             return False
         if not data:
             return False
+        addr_key = (addr[0], addr[1])
+        if self._discovery_pending is not None and self._discovery_pending[0] == addr_key:
+            _, future = self._discovery_pending
+            self._discovery_pending = None
+            if not future.done():
+                future.set_result(data)
+            return True
         if self._network_debug:
             desc = describe_discovery_message(data, self.config.network_id)
             logger.debug("UDP 9973 RECV from %s:%s [%s] %d bytes", addr[0], addr[1], desc, len(data))
@@ -225,6 +251,28 @@ async def _discover_node(
     )
 
 
+async def _discover_node_via_proxy(
+    proxy: "UDPProxy",
+    host: str,
+    port: int,
+    network_id: int,
+    timeout: float,
+) -> Optional[bytes]:
+    """Try Ping then FindNode from proxy socket (port 9973) so node sees us as a discovery peer. Returns Neighbors bytes or None."""
+    ping_timeout = min(3.0, timeout / 2)
+    find_timeout = max(1.0, timeout - ping_timeout)
+    target = (host, port)
+    ping_msg = build_ping_message(network_id, os.urandom(32))
+    find_msg = build_find_node_message(network_id, os.urandom(32))
+    pong = await proxy.send_discovery_and_wait(ping_msg, target, ping_timeout)
+    if pong is not None and os.environ.get("SNIFFER_NETWORK_DEBUG"):
+        logger.debug("UDP 9973 RECV (discovery) from %s:%s [%s] %d bytes", host, port, describe_discovery_message(pong, network_id), len(pong))
+    neighbors_resp = await proxy.send_discovery_and_wait(find_msg, target, find_timeout)
+    if neighbors_resp is not None and os.environ.get("SNIFFER_NETWORK_DEBUG"):
+        logger.debug("UDP 9973 RECV (discovery) from %s:%s [%s] %d bytes", host, port, describe_discovery_message(neighbors_resp, network_id), len(neighbors_resp))
+    return neighbors_resp
+
+
 async def discover_from_node(
     config: Config,
     host: str,
@@ -336,17 +384,28 @@ async def process_and_store_node(
 FINDNODE_DELAY_SEC = 1.0
 
 
-async def discovery_loop(config: Config, db_path: str) -> None:
+async def discovery_loop(config: Config, db_path: str, proxy: Optional["UDPProxy"] = None) -> None:
     """Ask every known node for neighbors (one full cycle), then restart from start. On no response 30m -> offline, 48h -> dead."""
     await init_db(db_path)
     network_id = config.network_id
     start_list = config.starting_nodes or (
         DEFAULT_MAINNET if network_id == 0 else DEFAULT_TESTNET
     )
+    # Include reference_nodes in discovery so they get explored too (merge, dedupe by (host, port))
+    ref_list = config.reference_nodes or []
     seen: Set[Tuple[str, int]] = set()
-    to_ask: List[Tuple[str, int]] = [config.parse_node(s) for s in start_list]
+    to_ask: List[Tuple[str, int]] = []
+    for s in start_list:
+        t = config.parse_node(s)
+        if t not in seen:
+            seen.add(t)
+            to_ask.append(t)
+    for s in ref_list:
+        t = config.parse_node(s)
+        if t not in seen:
+            seen.add(t)
+            to_ask.append(t)
     for (h, p) in to_ask:
-        seen.add((h, p))
         await ensure_node_in_db(db_path, h, p, from_neighbors=False)
         asyncio.create_task(enrich_node(config, db_path, h, p))
 
@@ -380,12 +439,16 @@ async def discovery_loop(config: Config, db_path: str) -> None:
             display = _display_node(explore_host, domain)
             try:
                 logger.info("FindNode (discover neighbor) -> %s:%s", display, port)
-                resp = await _discover_node(
-                    explore_host,
-                    port,
-                    network_id,
-                    float(config.udp_timeout_seconds),
-                )
+                resp = None
+                if proxy is not None:
+                    resp = await _discover_node_via_proxy(proxy, explore_host, port, network_id, float(config.udp_timeout_seconds))
+                if resp is None:
+                    resp = await _discover_node(
+                        explore_host,
+                        port,
+                        network_id,
+                        float(config.udp_timeout_seconds),
+                    )
                 if not resp:
                     logger.info("FindNode reply from %s:%s: (no response / timeout)", display, port)
                     if os.environ.get("SNIFFER_DEBUG"):
@@ -456,7 +519,7 @@ async def run_daemon(config: Config) -> None:
     try:
         await asyncio.gather(
             proxy.run_relay_loop(),
-            discovery_loop(config, config.database_path),
+            discovery_loop(config, config.database_path, proxy),
         )
     finally:
         proxy.stop()

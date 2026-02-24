@@ -15,7 +15,7 @@ A small proxy that connects to the Alephium P2P discovery network, discovers nod
 Copy `config.example.yaml` to `config.yaml`. Key options:
 
 - **starting_nodes**: Bootstrap list to connect to first.
-- **reference_nodes**: Nodes used to relay incoming discovery requests (e.g. mainnet bootstrap from `alephium/flow/src/main/resources/network_mainnet.conf.tmpl`).
+- **reference_nodes**: Nodes used to relay incoming discovery requests; they are **also** added to the discovery list so they get explored for neighbors (merged with starting_nodes, no duplicate).
 - **network_id**: `0` = mainnet, `1` = testnet.
 
 Reference nodes for mainnet (from Alephium config):
@@ -84,6 +84,8 @@ Example:
 - `DISCOVERY RECV from 3.14.19.103:9973 [Neighbors (5 peers)] 200 bytes` or `(Neighbors timeout)`
 
 (DEBUG level is enabled automatically when either `SNIFFER_DEBUG` or `SNIFFER_NETWORK_DEBUG` is set.)
+
+Discovery tries **from the proxy socket (port 9973) first** so remote nodes see your sniffer as a discovery peer; if that times out, it falls back to an ephemeral port. If you always see timeouts, ensure **incoming UDP** is allowed to your host (port 9973 and, for fallback, ephemeral ports). Firewalls or NAT can block Pong/Neighbors replies.
 
 ## API
 
