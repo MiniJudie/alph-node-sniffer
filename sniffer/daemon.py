@@ -192,21 +192,31 @@ def _discover_node_sync(
     timeout: float,
 ) -> Optional[bytes]:
     """
-    Blocking: Ping then FindNode on the same socket so the node sees us before FindNode.
-    Returns raw Neighbors response bytes or None. Run via run_in_executor.
+    Blocking: Try FindNode first (like Alephium bootstrap), then Ping+FindNode. Run via run_in_executor.
     """
     network_debug = bool(os.environ.get("SNIFFER_NETWORK_DEBUG"))
-    ping_timeout = min(3.0, timeout / 2)
-    find_timeout = timeout - ping_timeout
-    if find_timeout < 1.0:
-        find_timeout = timeout
-        ping_timeout = 0
+    find_first_timeout = min(timeout, 10.0)
     sock = None
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        sock.settimeout(ping_timeout)
-        ping_msg = build_ping_message(network_id, os.urandom(32))
+        sock.settimeout(find_first_timeout)
         find_msg = build_find_node_message(network_id, os.urandom(32))
+        sock.sendto(find_msg, (host, port))
+        if network_debug:
+            logger.debug("DISCOVERY SEND to %s:%s [FindNode first] %d bytes", host, port, len(find_msg))
+        try:
+            resp, from_addr = sock.recvfrom(65535)
+            if network_debug:
+                logger.debug("DISCOVERY RECV from %s:%s [%s] %d bytes (FindNode-first)", from_addr[0], from_addr[1], describe_discovery_message(resp, network_id), len(resp))
+            return resp
+        except socket.timeout:
+            if network_debug:
+                logger.debug("DISCOVERY RECV from %s:%s (FindNode-first timeout)", host, port)
+        # Fallback: Ping then FindNode
+        ping_timeout = min(3.0, max(0, timeout - find_first_timeout) / 2)
+        find_timeout = max(1.0, timeout - find_first_timeout - ping_timeout)
+        ping_msg = build_ping_message(network_id, os.urandom(32))
+        sock.settimeout(ping_timeout)
         sock.sendto(ping_msg, (host, port))
         if network_debug:
             logger.debug("DISCOVERY SEND to %s:%s [%s] %d bytes", host, port, describe_discovery_message(ping_msg, network_id), len(ping_msg))
@@ -258,16 +268,24 @@ async def _discover_node_via_proxy(
     network_id: int,
     timeout: float,
 ) -> Optional[bytes]:
-    """Try Ping then FindNode from proxy socket (port 9973) so node sees us as a discovery peer. Returns Neighbors bytes or None."""
-    ping_timeout = min(3.0, timeout / 2)
-    find_timeout = max(1.0, timeout - ping_timeout)
+    """Try FindNode first (like Alephium bootstrap), then Ping+FindNode from proxy socket (port 9973). Returns Neighbors bytes or None."""
     target = (host, port)
-    ping_msg = build_ping_message(network_id, os.urandom(32))
     find_msg = build_find_node_message(network_id, os.urandom(32))
+    ping_msg = build_ping_message(network_id, os.urandom(32))
+    # 1) FindNode only first (how real nodes bootstrap: fetchNeighbors sends FindNode with no prior Ping)
+    find_timeout = min(timeout, 10.0)
+    resp = await proxy.send_discovery_and_wait(find_msg, target, find_timeout)
+    if resp is not None:
+        if os.environ.get("SNIFFER_NETWORK_DEBUG"):
+            logger.debug("UDP 9973 RECV (discovery) from %s:%s [%s] %d bytes (FindNode-first)", host, port, describe_discovery_message(resp, network_id), len(resp))
+        return resp
+    # 2) Fallback: Ping then FindNode
+    ping_timeout = min(3.0, max(0, timeout - find_timeout) / 2)
+    find_timeout2 = max(1.0, timeout - find_timeout - ping_timeout)
     pong = await proxy.send_discovery_and_wait(ping_msg, target, ping_timeout)
     if pong is not None and os.environ.get("SNIFFER_NETWORK_DEBUG"):
         logger.debug("UDP 9973 RECV (discovery) from %s:%s [%s] %d bytes", host, port, describe_discovery_message(pong, network_id), len(pong))
-    neighbors_resp = await proxy.send_discovery_and_wait(find_msg, target, find_timeout)
+    neighbors_resp = await proxy.send_discovery_and_wait(find_msg, target, find_timeout2)
     if neighbors_resp is not None and os.environ.get("SNIFFER_NETWORK_DEBUG"):
         logger.debug("UDP 9973 RECV (discovery) from %s:%s [%s] %d bytes", host, port, describe_discovery_message(neighbors_resp, network_id), len(neighbors_resp))
     return neighbors_resp

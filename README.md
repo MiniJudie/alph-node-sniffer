@@ -85,7 +85,7 @@ Example:
 
 (DEBUG level is enabled automatically when either `SNIFFER_DEBUG` or `SNIFFER_NETWORK_DEBUG` is set.)
 
-Discovery tries **from the proxy socket (port 9973) first** so remote nodes see your sniffer as a discovery peer; if that times out, it falls back to an ephemeral port. If you always see timeouts, ensure **incoming UDP** is allowed to your host (port 9973 and, for fallback, ephemeral ports). Firewalls or NAT can block Pong/Neighbors replies.
+Discovery tries **FindNode first** (no Ping), matching how Alephium bootstraps (`fetchNeighbors` sends FindNode directly). If that times out, it tries Ping then FindNode. It also uses the **proxy socket (port 9973)** first, then falls back to an ephemeral port. The protocol does not require a separate “hello” before FindNode. If you still see timeouts, **incoming UDP** to your host is likely blocked (firewall/NAT): allow port 9973 and ephemeral ports.
 
 ## API
 
