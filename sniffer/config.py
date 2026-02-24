@@ -17,6 +17,7 @@ class Config:
     reference_nodes: List[str] = field(default_factory=list)
     database_path: str = "nodes.db"
     rest_port_probe: int = 12973
+    broker_port: int = 27665
     scan_interval_seconds: int = 300
     udp_timeout_seconds: int = 5
 
@@ -42,6 +43,7 @@ class Config:
             reference_nodes=data.get("reference_nodes", []),
             database_path=data.get("database_path", "nodes.db"),
             rest_port_probe=data.get("rest_port_probe", 12973),
+            broker_port=data.get("broker_port", 27665),
             scan_interval_seconds=data.get("scan_interval_seconds", 300),
             udp_timeout_seconds=data.get("udp_timeout_seconds", 5),
         )

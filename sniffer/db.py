@@ -24,6 +24,7 @@ async def init_db(db_path: str) -> None:
                 address TEXT NOT NULL,
                 port INTEGER NOT NULL,
                 domain TEXT,
+                clique_id TEXT,
                 version TEXT,
                 country TEXT,
                 city TEXT,
@@ -52,6 +53,9 @@ async def init_db(db_path: str) -> None:
             await db.execute("ALTER TABLE nodes ADD COLUMN last_explored REAL")
             await db.execute("UPDATE nodes SET last_explored = last_seen WHERE last_explored IS NULL")
             await db.commit()
+        if "clique_id" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN clique_id TEXT")
+            await db.commit()
 
         # Indexes (after migration so columns exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
@@ -68,6 +72,7 @@ async def upsert_node(
     port: int,
     *,
     domain: Optional[str] = None,
+    clique_id: Optional[str] = None,
     version: Optional[str] = None,
     country: Optional[str] = None,
     city: Optional[str] = None,
@@ -79,7 +84,7 @@ async def upsert_node(
     last_explored: Optional[float] = None,
     revive_dead: bool = False,
 ) -> None:
-    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline."""
+    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. clique_id is hex string (66 chars)."""
     now = time.time()
     st = status or STATUS_OFFLINE
     fse = first_seen if first_seen is not None else now
@@ -94,10 +99,11 @@ async def upsert_node(
             await db.commit()
         await db.execute(
             """
-            INSERT INTO nodes (address, port, domain, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(address, port) DO UPDATE SET
                 domain = COALESCE(excluded.domain, domain),
+                clique_id = COALESCE(excluded.clique_id, clique_id),
                 version = COALESCE(excluded.version, version),
                 country = COALESCE(excluded.country, country),
                 city = COALESCE(excluded.city, city),
@@ -112,6 +118,7 @@ async def upsert_node(
                 address,
                 port,
                 domain or address,
+                clique_id,
                 version,
                 country,
                 city,
@@ -132,19 +139,23 @@ async def update_node_enrichment(
     port: int,
     *,
     domain: Optional[str] = None,
+    clique_id: Optional[str] = None,
     version: Optional[str] = None,
     country: Optional[str] = None,
     city: Optional[str] = None,
     continent: Optional[str] = None,
     has_api: Optional[bool] = None,
 ) -> None:
-    """Update only enrichment fields (version, geo, has_api); does not change status or timestamps."""
+    """Update only enrichment fields (version, geo, has_api, clique_id); does not change status or timestamps."""
     async with aiosqlite.connect(db_path) as db:
         updates = []
         params: List[Any] = []
         if domain is not None:
             updates.append("domain = ?")
             params.append(domain)
+        if clique_id is not None:
+            updates.append("clique_id = ?")
+            params.append(clique_id)
         if version is not None:
             updates.append("version = ?")
             params.append(version)
@@ -285,7 +296,7 @@ async def get_nodes(
     version: Optional[str] = None,
     status: Optional[str] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    query = "SELECT address, port, domain, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored FROM nodes WHERE 1=1"
+    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, status, first_seen, last_seen, last_explored FROM nodes WHERE 1=1"
     params: List[Any] = []
     if continent is not None:
         query += " AND continent = ?"
@@ -311,6 +322,7 @@ async def get_nodes(
                     "address": row["address"],
                     "port": row["port"],
                     "domain": row["domain"],
+                    "clique_id": row["clique_id"],
                     "version": row["version"],
                     "country": row["country"],
                     "city": row["city"],

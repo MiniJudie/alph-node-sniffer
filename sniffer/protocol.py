@@ -1,20 +1,33 @@
 """
-Alephium discovery protocol wire format (UDP).
+Alephium discovery protocol wire format (UDP) and TCP broker Hello (client version).
 Based on alephium/protocol DiscoveryMessage and MessageSerde.
+
+Encoding verification (vs Alephium):
+- Frame: magic(4) + checksum(4) + length(4) + data (MessageSerde.unwrap order).
+- Magic: Bytes.from(Hash.hash("alephium-${networkId.id}").toRandomIntUnsafe); Hash=Blake2b(32),
+  toRandomIntUnsafe = sum of 8×4-byte big-endian ints; Bytes.from = 4-byte BE (NetworkConfig.scala).
+- Checksum: DjbHash.intHash(data), 4-byte BE (MessageSerde.checksum).
+- Length: data.length, 4-byte BE (MessageSerde.length).
+- Data: signature(64) + header + payload. signature = 64 zeros when senderCliqueId is None (Ping/FindNode).
+- Header: DiscoveryVersion (compact signed int, value 65536 → 4 bytes 0x80 0x01 0x00 0x00).
+- Payload: intSerde(Code.toInt) ++ payload_bytes; Code: Ping=0, Pong=1, FindNode=2, Neighbors=3.
+- Ping: Id(32) + Option[BrokerInfo]; Option None = 1 byte 0 (optionSerde).
+- FindNode: targetId (CliqueId = PublicKey, 33 bytes).
 """
+import socket
 import struct
 import hashlib
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-# Discovery version used by the network
-CURRENT_DISCOVERY_VERSION = 1
+# Discovery version used by the network (Alephium CurrentDiscoveryVersion = Bytes.toIntUnsafe(ByteString(0,1,0,0)) = 65536)
+CURRENT_DISCOVERY_VERSION = 65536
 # Payload type codes: Ping=0, Pong=1, FindNode=2, Neighbors=3
 CODE_NEIGHBORS = 3
 # Secp256k1 signature size
 SIGNATURE_LENGTH = 64
-# CliqueId = PublicKey size
-CLIQUE_ID_LENGTH = 32
+# CliqueId = PublicKey size (SecP256K1PublicKey = 33 bytes compressed)
+CLIQUE_ID_LENGTH = 33
 # Magic bytes length
 MAGIC_LENGTH = 4
 CHECKSUM_LENGTH = 4
@@ -114,7 +127,7 @@ def decode_length_prefixed_bytes(data: bytes) -> Tuple[bytes, int]:
 @dataclass
 class BrokerInfo:
     """One peer from Neighbors (address is discovery UDP address)."""
-    clique_id: bytes  # 32
+    clique_id: bytes  # 33 (SecP256K1PublicKey)
     broker_id: int
     broker_num: int
     address: str  # host
@@ -122,7 +135,7 @@ class BrokerInfo:
 
 
 def parse_broker_info(data: bytes) -> Tuple[BrokerInfo, int]:
-    """Parse one BrokerInfo: cliqueId(32) + brokerId + brokerNum + InetAddress + port."""
+    """Parse one BrokerInfo: cliqueId(33) + brokerId + brokerNum + InetAddress + port."""
     if len(data) < CLIQUE_ID_LENGTH:
         raise ValueError("data too short for BrokerInfo")
     clique_id = data[:CLIQUE_ID_LENGTH]
@@ -255,7 +268,7 @@ def extract_neighbors_from_message(raw: bytes, network_id: int) -> List[BrokerIn
 def build_find_node_message(network_id: int, target_clique_id: bytes) -> bytes:
     """
     Build a FindNode request (no signature needed: senderCliqueId is None -> zero signature).
-    target_clique_id: 32 bytes (any CliqueId, e.g. random for discovery).
+    target_clique_id: 33 bytes (any CliqueId = PublicKey, e.g. random for discovery).
     """
     magic = magic_bytes(network_id)
     # signature: 64 zero bytes
@@ -269,6 +282,79 @@ def build_find_node_message(network_id: int, target_clique_id: bytes) -> bytes:
     msg_checksum = checksum(data)
     msg_length = struct.pack(">I", len(data))
     return magic + msg_checksum + msg_length + data
+
+
+# --- TCP broker (Hello message for client version) ---
+# TCP frame same as UDP: magic(4) + checksum(4) + length(4) + data.
+# data = header (WireVersion, compact int) + payload (code compact int + Hello: clientId length-prefixed string + ...).
+
+
+def parse_tcp_hello_client_id(data: bytes) -> Optional[str]:
+    """
+    Parse TCP broker message data (after unwrap) and return clientId from Hello payload if present.
+    data = header (WireVersion compact int) + payload (code + clientId length + clientId bytes + ...).
+    Returns None if not a Hello or parse error.
+    """
+    try:
+        pos = 0
+        _, n = decode_compact_int(data)
+        pos += n
+        if pos >= len(data):
+            return None
+        code, n = decode_compact_int(data[pos:])
+        pos += n
+        if code != 0:
+            return None  # not Hello
+        if pos >= len(data):
+            return None
+        size, n = decode_compact_int(data[pos:])
+        pos += n
+        if size < 0 or size > 256 or pos + size > len(data):
+            return None
+        client_id_bytes = data[pos : pos + size]
+        return client_id_bytes.decode("utf-8")
+    except (ValueError, UnicodeDecodeError, IndexError):
+        return None
+
+
+def fetch_client_version_tcp(
+    host: str, port: int, network_id: int, timeout: float = 5.0
+) -> Optional[str]:
+    """
+    Connect to node's broker TCP port, read first message (expect Hello), return clientId string
+    (e.g. 'scala-alephium/v3.1.1/Linux') or None. Does not send anything; server sends Hello first
+    on inbound connection. Closes connection after reading one message.
+    """
+    magic = magic_bytes(network_id)
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        try:
+            header = sock.recv(12)
+            if len(header) < 12:
+                return None
+            msg_len = int.from_bytes(header[8:12], "big")
+            if msg_len <= 0 or msg_len > 0x100000:
+                return None
+            rest = b""
+            while len(rest) < msg_len:
+                chunk = sock.recv(min(8192, msg_len - len(rest)))
+                if not chunk:
+                    return None
+                rest += chunk
+            raw = header + rest
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+        data = unwrap_message(raw, magic)
+        if not data:
+            return None
+        return parse_tcp_hello_client_id(data)
+    except OSError:
+        return None
 
 
 def build_ping_message(network_id: int, session_id: bytes) -> bytes:

@@ -1,8 +1,11 @@
-"""Check if node exposes Alephium REST API and get version."""
+"""Check if node exposes Alephium REST API and get version; fallback to TCP broker Hello for clientId."""
+import asyncio
 import logging
 from typing import Optional, Tuple
 
 import httpx
+
+from sniffer.protocol import fetch_client_version_tcp
 
 logger = logging.getLogger(__name__)
 
@@ -48,3 +51,20 @@ async def check_rest_api(
         if has_api or version:
             return (True, version)
     return (False, None)
+
+
+async def get_client_version_tcp(
+    host: str,
+    broker_port: int,
+    network_id: int,
+    timeout: float = 5.0,
+) -> Optional[str]:
+    """
+    Get client version from node's TCP broker (Hello message). Runs sync fetch in executor.
+    Returns clientId string (e.g. 'scala-alephium/v3.1.1/Linux') or None.
+    """
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: fetch_client_version_tcp(host, broker_port, network_id, timeout),
+    )

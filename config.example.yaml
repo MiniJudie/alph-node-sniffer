@@ -31,6 +31,9 @@ database_path: "nodes.db"
 # Common REST API port to probe for node version (Alephium default)
 rest_port_probe: 12973
 
+# TCP broker port for P2P (used to fetch client version via Hello when REST has no version)
+broker_port: 27665
+
 # Scan interval in seconds (how often to ask for more neighbors)
 scan_interval_seconds: 300
 

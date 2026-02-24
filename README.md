@@ -17,6 +17,7 @@ Copy `config.example.yaml` to `config.yaml`. Key options:
 - **starting_nodes**: Bootstrap list to connect to first.
 - **reference_nodes**: Nodes used to relay incoming discovery requests; they are **also** added to the discovery list so they get explored for neighbors (merged with starting_nodes, no duplicate).
 - **network_id**: `0` = mainnet, `1` = testnet.
+- **broker_port**: TCP broker port (default 27665) used to fetch **client version** via the P2P Hello message when the REST API does not expose a version.
 
 Reference nodes for mainnet (from Alephium config):
 
@@ -54,8 +55,25 @@ Or run the HTTP API only:
 python3 -m sniffer api
 ```
 
+To **manually ping a node** (send one Ping and wait for Pong):
+
+```bash
+python3 -m sniffer ping bootstrap0.alephium.org:9973
+python3 -m sniffer ping 1.2.3.4:9973 --network-id 1 --timeout 10
+```
+
 - Discovery proxy: UDP on `bind_address` (default 0.0.0.0:9973).
 - Explorer API: http://localhost:9090 (Swagger at http://localhost:9090/docs).
+
+## UDP discovery vs TCP broker (real nodes)
+
+A full Alephium node uses **two separate channels**:
+
+1. **UDP discovery (port 9973)** – Handled by `DiscoveryServer`. Receives Ping, Pong, FindNode, Neighbors. **No Hello or client id**. The node responds to FindNode with Neighbors and to Ping with Pong without any prior handshake. At startup it sends FindNode to bootstrap nodes directly (`fetchNeighbors`).
+
+2. **TCP broker (e.g. port 27665)** – Handled by `InterCliqueManager` / `InboundBrokerHandler`. Used for flow data (blocks, sync). The **first** message on TCP is **Hello** (with `clientId` like `scala-alephium/v4.3.0/Linux`). The node validates `ReleaseVersion` and `P2PVersion` from `clientId`; if the version is unknown or unsupported, it logs “Unknown client id” and **bans** that TCP peer (`InvalidClientVersion`). So the bans you see in node logs are for **TCP** connections with an invalid or old client version, not for UDP discovery.
+
+**This sniffer** uses **UDP discovery** (port 9973) for neighbors. It also opens a **TCP** connection to each node’s broker port (configurable `broker_port`, default 27665) when enriching: it connects, **reads** the first Hello message (server sends first on inbound), extracts `clientId` for the version field, then closes without sending anything—so it is **not** subject to InvalidClientVersion. Discovery itself does not require TCP; if discovery times out, the cause is typically **incoming UDP** being blocked (firewall/NAT).
 
 ## Debug
 
@@ -86,6 +104,22 @@ Example:
 (DEBUG level is enabled automatically when either `SNIFFER_DEBUG` or `SNIFFER_NETWORK_DEBUG` is set.)
 
 Discovery tries **FindNode first** (no Ping), matching how Alephium bootstraps (`fetchNeighbors` sends FindNode directly). If that times out, it tries Ping then FindNode. It also uses the **proxy socket (port 9973)** first, then falls back to an ephemeral port. The protocol does not require a separate “hello” before FindNode. If you still see timeouts, **incoming UDP** to your host is likely blocked (firewall/NAT): allow port 9973 and ephemeral ports.
+
+To **inspect the exact bytes** we send for Ping and FindNode (e.g. to compare with a capture or the Alephium spec), run:
+
+```bash
+python3 scripts/dump_discovery_bytes.py [network_id]
+```
+
+This prints full hex and a per-field breakdown (magic, checksum, length, signature, header, payload type, payload). Default `network_id` is 0 (mainnet). Our encoding is documented and verified against `alephium/protocol` (see `sniffer/protocol.py` docstring).
+
+To **send a FindNode and print the parsed Neighbors response**:
+
+```bash
+python3 scripts/find_neighbors.py <host:port> [--network-id 0] [--timeout 10]
+```
+
+Example: `python3 scripts/find_neighbors.py bootstrap0.alephium.org:9973`. If you get a timeout, incoming UDP to your host may be blocked (firewall/NAT).
 
 ## API
 

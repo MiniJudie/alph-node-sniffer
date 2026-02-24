@@ -28,7 +28,7 @@ from sniffer.protocol import (
     get_response_payload_type,
     magic_bytes,
 )
-from sniffer.version_check import check_rest_api
+from sniffer.version_check import check_rest_api, get_client_version_tcp
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ DEFAULT_TESTNET = [
 
 
 def _random_clique_id() -> bytes:
-    return os.urandom(32)
+    return os.urandom(33)
 
 
 def _display_node(host: str, domain: Optional[str]) -> str:
@@ -200,7 +200,7 @@ def _discover_node_sync(
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.settimeout(find_first_timeout)
-        find_msg = build_find_node_message(network_id, os.urandom(32))
+        find_msg = build_find_node_message(network_id, os.urandom(33))
         sock.sendto(find_msg, (host, port))
         if network_debug:
             logger.debug("DISCOVERY SEND to %s:%s [FindNode first] %d bytes", host, port, len(find_msg))
@@ -270,7 +270,7 @@ async def _discover_node_via_proxy(
 ) -> Optional[bytes]:
     """Try FindNode first (like Alephium bootstrap), then Ping+FindNode from proxy socket (port 9973). Returns Neighbors bytes or None."""
     target = (host, port)
-    find_msg = build_find_node_message(network_id, os.urandom(32))
+    find_msg = build_find_node_message(network_id, os.urandom(33))
     ping_msg = build_ping_message(network_id, os.urandom(32))
     # 1) FindNode only first (how real nodes bootstrap: fetchNeighbors sends FindNode with no prior Ping)
     find_timeout = min(timeout, 10.0)
@@ -323,6 +323,13 @@ async def enrich_node(config: Config, db_path: str, address: str, port: int, *, 
             pass
     country, city, continent = await geolocate(host)
     has_api, version = await check_rest_api(host, config.rest_port_probe)
+    if version is None:
+        try:
+            version = await get_client_version_tcp(
+                host, config.broker_port, config.network_id, timeout=5.0
+            )
+        except Exception:
+            pass
     await update_node_enrichment(
         db_path,
         host,
@@ -383,11 +390,20 @@ async def process_and_store_node(
             pass
     country, city, continent = await geolocate(host)
     has_api, version = await check_rest_api(host, config.rest_port_probe)
+    if version is None:
+        try:
+            version = await get_client_version_tcp(
+                host, config.broker_port, config.network_id, timeout=5.0
+            )
+        except Exception:
+            pass
+    clique_id_hex = info.clique_id.hex() if info.clique_id else None
     await upsert_node(
         db_path,
         host,
         port,
         domain=info.address if info.address != host else None,
+        clique_id=clique_id_hex,
         version=version,
         country=country,
         city=city,
