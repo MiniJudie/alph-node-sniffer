@@ -430,7 +430,7 @@ async def process_and_store_node(
 
 
 # Delay between each FindNode in a cycle (seconds) to avoid flooding
-FINDNODE_DELAY_SEC = 1.0
+FINDNODE_DELAY_SEC = 2.0
 
 
 async def discovery_loop(config: Config, db_path: str, proxy: Optional["UDPProxy"] = None) -> None:
