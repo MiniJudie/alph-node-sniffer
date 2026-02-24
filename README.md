@@ -26,13 +26,24 @@ Testnet (when network_id=1):
 
 - bootstrap0.testnet.alephium.org:9973, bootstrap1.testnet.alephium.org:9973
 
-## Run
+## Setup
 
-Requires **Python 3.10+** (use `python3` on systems where `python` is not 3.x).
+Requires **Python 3.10+**. On Debian/Ubuntu and other systems that use an externally-managed Python environment, use a virtual environment:
 
 ```bash
+python3 -m venv .venv
+source .venv/bin/activate   # On Windows: .venv\Scripts\activate
 pip install -r requirements.txt
-# Edit config.yaml if needed (or it will use config.example.yaml)
+```
+
+(If you prefer not to use a venv, ensure you have a Python where `pip install` is allowed, e.g. `pip install --user -r requirements.txt` or a non-system Python.)
+
+## Run
+
+Copy `config.example.yaml` to `config.yaml` and edit if needed (or the daemon will use the example config).
+
+```bash
+# With venv activated (see Setup)
 python3 -m sniffer daemon
 ```
 
@@ -44,6 +55,16 @@ python3 -m sniffer api
 
 - Discovery proxy: UDP on `bind_address` (default 0.0.0.0:9973).
 - Explorer API: http://localhost:9090 (Swagger at http://localhost:9090/docs).
+
+## Debug
+
+To see detailed debug messages (e.g. discovery reply hex, ping/findnode hints), set `SNIFFER_DEBUG` and run the daemon:
+
+```bash
+SNIFFER_DEBUG=1 python3 -m sniffer daemon
+```
+
+This turns on DEBUG logging for the sniffer and prints extra lines when probing nodes (e.g. raw reply size and magic bytes when a response is received, or a hint when no reply is received).
 
 ## API
 
