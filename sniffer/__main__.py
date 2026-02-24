@@ -16,6 +16,9 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
     stream=sys.stdout,
 )
+if os.environ.get("SNIFFER_NETWORK_DEBUG"):
+    for name in ("httpx", "httpcore", "aiosqlite", "uvicorn", "uvicorn.error", "uvicorn.access"):
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def main() -> None:
