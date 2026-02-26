@@ -350,7 +350,7 @@ async def _enrich_node_impl(config: Config, db_path: str, address: str, port: in
     existing = await get_node_geo_dns(db_path, host)
     if existing:
         country, city, continent, country_code, isp, org, zip_val, lat, lon, reverse_dns_name, hoster = existing
-        has_geo = country is not None or city is not None or isp is not None
+        has_geo = lat is not None and lon is not None
         has_dns = reverse_dns_name is not None or hoster is not None
     else:
         has_geo, has_dns = False, False
@@ -591,7 +591,7 @@ async def _process_and_store_node_impl(
     existing = await get_node_geo_dns(db_path, host)
     if existing:
         country, city, continent, country_code, isp, org, zip_val, lat, lon, reverse_dns_name, hoster = existing
-        has_geo = country is not None or city is not None or isp is not None
+        has_geo = lat is not None and lon is not None
         has_dns = reverse_dns_name is not None or hoster is not None
     else:
         has_geo, has_dns = False, False
