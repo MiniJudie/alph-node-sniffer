@@ -37,7 +37,7 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         country: Optional[str] = Query(None, description="Filter by country"),
         has_api: Optional[bool] = Query(None, description="Filter by HTTP API exposed"),
         version: Optional[str] = Query(None, description="Filter by node version"),
-        status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
+        status: Optional[str] = Query(None, description="Filter by status: online, offline, unreachable"),
         synced: Optional[bool] = Query(None, description="Filter by sync: true=synced, false=not synced"),
     ):
         """Download all nodes (respecting filters) as CSV. Same query params as GET /nodes."""
@@ -95,10 +95,10 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         country: Optional[str] = Query(None, description="Filter by country"),
         has_api: Optional[bool] = Query(None, description="Filter by HTTP API exposed"),
         version: Optional[str] = Query(None, description="Filter by node version"),
-        status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
+        status: Optional[str] = Query(None, description="Filter by status: online, offline, unreachable"),
         synced: Optional[bool] = Query(None, description="Filter by sync: true=synced, false=not synced"),
     ):
-        """Paginated list of nodes. Response: { stats: { total, online, offline, dead, last_update }, nodes: [] }. Filters: continent, country, has_api, version, status, synced."""
+        """Paginated list of nodes. Response: { stats: { total, online, offline, unreachable, last_update }, nodes: [] }. Filters: continent, country, has_api, version, status, synced."""
         result = await get_nodes_paginated(
             db_path,
             page=page,
@@ -119,13 +119,13 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         "/status/node",
         tags=["Status"],
         summary="List all nodes as host:port -> status",
-        description="Returns a map of '<address>:<port>' to status (online, offline, dead). Optional status filter.",
+        description="Returns a map of '<address>:<port>' to status (online, offline, unreachable). Optional status filter.",
         response_model=Dict[str, str],
-        responses={200: {"description": "Map of '<host>:<port>' to status (online, offline, dead)"}},
+        responses={200: {"description": "Map of '<host>:<port>' to status (online, offline, unreachable)"}},
         operation_id="get_status_node",
     )
     async def status_node(
-        status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
+        status: Optional[str] = Query(None, description="Filter by status: online, offline, unreachable"),
     ):
         """Returns { '<host>:<port>': '<status>', ... }. Use status query to filter (e.g. ?status=online)."""
         out: Dict[str, str] = {}

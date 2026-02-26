@@ -64,12 +64,12 @@ def chain_heights_for_json(m: Optional[ChainHeightsMap]) -> Optional[Dict[str, i
     return {f"{k[0]},{k[1]}": v for k, v in m.items()}
 
 
-# Status: online, offline, dead (no response 30m -> offline, 48h -> dead)
+# Status: online, offline, unreachable (no response 30m -> offline, 48h -> unreachable)
 STATUS_ONLINE = "online"
 STATUS_OFFLINE = "offline"
-STATUS_DEAD = "dead"
+STATUS_UNREACHABLE = "unreachable"
 OFFLINE_THRESHOLD_SEC = 60 * 60   # 30 minutes without response
-DEAD_THRESHOLD_SEC = 48 * 3600    # 48 hours without response
+UNREACHABLE_THRESHOLD_SEC = 48 * 3600    # 48 hours without response
 
 # Port status (reachable / closed)
 PORT_STATUS_REACHABLE = "reachable"
@@ -288,6 +288,10 @@ async def init_db(db_path: str) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_synced ON nodes(synced)")
         await db.commit()
 
+        # Migration: rename status 'dead' -> 'unreachable'
+        await db.execute("UPDATE nodes SET status = 'unreachable' WHERE status = 'dead'")
+        await db.commit()
+
         # Table: one row per (node address, node discovery port, probed port) with type and status
         await db.execute("""
             CREATE TABLE IF NOT EXISTS node_ports (
@@ -335,7 +339,7 @@ async def upsert_node(
     os: Optional[str] = None,
     preserve_status: bool = False,
 ) -> None:
-    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. If preserve_status=True, on conflict do not overwrite status (used by enrichment to keep port-derived online/offline). clique_id is hex string (66 chars). chain_heights: dict (fromGroup,toGroup) -> height from broker ChainState or REST. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
+    """Insert or update node. If revive_dead=True and node exists as unreachable, set status to offline. If preserve_status=True, on conflict do not overwrite status (used by enrichment to keep port-derived online/offline). clique_id is hex string (66 chars). chain_heights: dict (fromGroup,toGroup) -> height from broker ChainState or REST. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
     now = time.time()
     st = status or STATUS_OFFLINE
     fse = first_seen if first_seen is not None else now
@@ -345,7 +349,7 @@ async def upsert_node(
         if revive_dead:
             await db.execute(
                 "UPDATE nodes SET status = ? WHERE address = ? AND status = ?",
-                (STATUS_OFFLINE, address, STATUS_DEAD),
+                (STATUS_OFFLINE, address, STATUS_UNREACHABLE),
             )
             await db.commit()
         await db.execute(
@@ -549,7 +553,7 @@ async def mark_exploration_success(db_path: str, address: str, port: int) -> Non
 
 
 async def mark_exploration_failed(db_path: str, address: str, port: int) -> None:
-    """Called when we got no response. Sets last_explored=now; offline if last_seen > 30m ago, dead if > 48h."""
+    """Called when we got no response. Sets last_explored=now; offline if last_seen > 30m ago, unreachable if > 48h."""
     now = time.time()
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -562,8 +566,8 @@ async def mark_exploration_failed(db_path: str, address: str, port: int) -> None
             return
         last_seen = row["last_seen"] or 0
         age = now - last_seen
-        if age >= DEAD_THRESHOLD_SEC:
-            new_status = STATUS_DEAD
+        if age >= UNREACHABLE_THRESHOLD_SEC:
+            new_status = STATUS_UNREACHABLE
         elif age >= OFFLINE_THRESHOLD_SEC:
             new_status = STATUS_OFFLINE
         else:
@@ -668,7 +672,7 @@ async def increment_misbehavior_count(db_path: str, address: str) -> int:
 async def update_node_status_from_port_statuses(db_path: str, address: str, port: int) -> None:
     """
     Set node status from discovery/broker/rest/icmp statuses: online if any is reachable,
-    else offline/dead (based on last_seen age). Updates last_seen when any port is reachable,
+    else offline/unreachable (based on last_seen age). Updates last_seen when any port is reachable,
     and last_explored always.
     """
     now = time.time()
@@ -694,8 +698,8 @@ async def update_node_status_from_port_statuses(db_path: str, address: str, port
         else:
             last_seen = row["last_seen"] or 0
             age = now - last_seen
-            if age >= DEAD_THRESHOLD_SEC:
-                new_status = STATUS_DEAD
+            if age >= UNREACHABLE_THRESHOLD_SEC:
+                new_status = STATUS_UNREACHABLE
             elif age >= OFFLINE_THRESHOLD_SEC:
                 new_status = STATUS_OFFLINE
             else:
@@ -754,12 +758,12 @@ async def get_nodes_without_version(db_path: str, limit: int = 50) -> List[tuple
     return [(r[0], r[1], r[2]) for r in rows]
 
 
-async def revive_if_dead(db_path: str, address: str, port: int) -> bool:
-    """If node is dead, set status=offline so it gets explored again. Returns True if was dead and revived."""
+async def revive_if_unreachable(db_path: str, address: str, port: int) -> bool:
+    """If node is unreachable, set status=offline so it gets explored again. Returns True if was unreachable and revived."""
     async with aiosqlite.connect(db_path) as db:
         cur = await db.execute(
             "UPDATE nodes SET status = ?, port = ? WHERE address = ? AND status = ?",
-            (STATUS_OFFLINE, port, address, STATUS_DEAD),
+            (STATUS_OFFLINE, port, address, STATUS_UNREACHABLE),
         )
         await db.commit()
         return cur.rowcount > 0
@@ -871,15 +875,15 @@ async def get_stats(db_path: str) -> dict[str, Any]:
         total = 0
         online = 0
         offline = 0
-        dead = 0
+        unreachable = 0
         for row in rows:
             total += row["cnt"]
             if row["status"] == STATUS_ONLINE:
                 online = row["cnt"]
             elif row["status"] == STATUS_OFFLINE:
                 offline = row["cnt"]
-            elif row["status"] == STATUS_DEAD:
-                dead = row["cnt"]
+            elif row["status"] == STATUS_UNREACHABLE:
+                unreachable = row["cnt"]
         async with db.execute(
             "SELECT MAX(COALESCE(last_explored, 0)), MAX(COALESCE(last_seen, 0)) FROM nodes"
         ) as cur:
@@ -890,7 +894,7 @@ async def get_stats(db_path: str) -> dict[str, Any]:
             "total_discovered": total,
             "online": online,
             "offline": offline,
-            "dead": dead,
+            "unreachable": unreachable,
             "last_update": last_update,
         }
 
@@ -1100,7 +1104,7 @@ async def get_nodes_paginated(
     page: int = 1,
     limit: int = 50,
 ) -> dict[str, Any]:
-    """Return { stats: { total, online, offline, dead, last_update }, nodes: [...] } with paging. Stats apply to filtered set."""
+    """Return { stats: { total, online, offline, unreachable, last_update }, nodes: [...] } with paging. Stats apply to filtered set."""
     where, params = _nodes_where_clause(
         continent=continent,
         country=country,
@@ -1116,16 +1120,16 @@ async def get_nodes_paginated(
             SELECT COUNT(*) AS total,
                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS online,
                    SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS offline,
-                   SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS dead
+                   SUM(CASE WHEN status = ? THEN 1 ELSE 0 END) AS unreachable
             FROM nodes WHERE {where}
         """
-        stats_params = [STATUS_ONLINE, STATUS_OFFLINE, STATUS_DEAD] + params
+        stats_params = [STATUS_ONLINE, STATUS_OFFLINE, STATUS_UNREACHABLE] + params
         async with db.execute(stats_query, stats_params) as cur:
             row = await cur.fetchone()
         total = row[0] or 0
         online = row[1] or 0
         offline = row[2] or 0
-        dead = row[3] or 0
+        unreachable = row[3] or 0
         # last_update: max of last_explored/last_seen (global, not filtered)
         async with db.execute(
             "SELECT MAX(COALESCE(last_explored, 0)), MAX(COALESCE(last_seen, 0)) FROM nodes"
@@ -1188,7 +1192,7 @@ async def get_nodes_paginated(
             "total": total,
             "online": int(online),
             "offline": int(offline),
-            "dead": int(dead),
+            "unreachable": int(unreachable),
             "last_update": last_update,
         },
         "nodes": nodes,

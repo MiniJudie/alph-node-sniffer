@@ -35,7 +35,7 @@ from sniffer.db import (
     upsert_node_port,
     upsert_node,
     update_synced_for_clique_peers,
-    revive_if_dead,
+    revive_if_unreachable,
     PORT_STATUS_REACHABLE,
     PORT_STATUS_CLOSED,
     PORT_TYPE_DISCOVERY,
@@ -176,7 +176,7 @@ async def _phase1_geo_dns(
                     host = ip
             display = _display_node(host, node.get("domain"))
             logger.info("Phase 1 [%d/%d]: testing %s (%s:%s)", i + 1, len(nodes), display, host, port)
-            existing = await get_node_geo_dns(db_path, host)
+            existing = await get_node_geo_dns(db_path, address)
             if existing:
                 country, city, continent, country_code, isp, org, zip_val, lat, lon, reverse_dns_name, hoster = existing
                 has_geo = lat is not None and lon is not None
@@ -191,10 +191,10 @@ async def _phase1_geo_dns(
                 reverse_dns_name, hoster = await reverse_dns_and_whois(host)
             icmp_reachable = await _icmp_ping(host, timeout_sec=2.0)
             icmp_status = PORT_STATUS_REACHABLE if icmp_reachable else PORT_STATUS_CLOSED
-            await update_node_port_statuses(db_path, host, port, icmp_status=icmp_status)
-            await update_node_status_from_port_statuses(db_path, host, port)
+            await update_node_port_statuses(db_path, address, port, icmp_status=icmp_status)
+            await update_node_status_from_port_statuses(db_path, address, port)
             await update_node_enrichment(
-                db_path, host, port,
+                db_path, address, port,
                 domain=address if address != host else None,
                 country=country, city=city, continent=continent,
                 country_code=country_code, isp=isp, org=org, zip=zip_val,
@@ -212,7 +212,7 @@ async def _phase2_rest_probe(
     nodes: List[Dict[str, Any]],
     sem: asyncio.Semaphore,
 ) -> None:
-    """Probe REST ports (rest_port_probe, 80, 443); handle 301 redirect to new host; try http and https; store cert domains if HTTPS. Set rest_port, rest_status, rest_url, has_api, cert_domains."""
+    """Probe REST ports (rest_port_probe, 80, 443); handle 301 redirect to new host; try http and https; store cert domains if HTTPS. Set rest_port, rest_status, rest_url, has_api, cert_domains. When node has domain or reverse_dns, also probe those hostnames (REST may be served by vhost on domain)."""
     timeout = 3.0
     for i, node in enumerate(nodes):
         async with sem:
@@ -223,13 +223,27 @@ async def _phase2_rest_probe(
                 ip = await _resolve_host(host, port)
                 if ip:
                     host = ip
+            # Build list of hosts to try: primary (address/resolved), then original hostname if different, then domain, then reverse_dns
+            hosts_to_try: List[str] = [host]
+            if address != host and address not in hosts_to_try:
+                hosts_to_try.append(address)
+            for alt in (node.get("domain"), node.get("reverse_dns")):
+                if alt and isinstance(alt, str) and alt.strip() and alt.strip() not in hosts_to_try:
+                    hosts_to_try.append(alt.strip())
             display = _display_node(host, node.get("domain"))
             logger.info("Phase 2 [%d/%d]: testing %s (%s:%s)", i + 1, len(nodes), display, host, port)
-            has_api, version, rest_url, cert_domains = await try_rest_with_301_and_cert(
-                host, config.rest_port_probe, timeout=timeout
-            )
+            has_api = False
+            version = None
+            rest_url = None
+            cert_domains: List[str] = []
+            for h in hosts_to_try:
+                has_api, version, rest_url, cert_domains = await try_rest_with_301_and_cert(
+                    h, config.rest_port_probe, timeout=timeout
+                )
+                if has_api and rest_url:
+                    break
             first_rest_port: Optional[int] = None
-            if rest_url:
+            if rest_url and has_api:
                 try:
                     parsed = urlparse(rest_url)
                     first_rest_port = parsed.port
@@ -237,15 +251,17 @@ async def _phase2_rest_probe(
                         first_rest_port = 443 if parsed.scheme == "https" else 80
                 except Exception:
                     first_rest_port = 443 if rest_url.startswith("https") else config.rest_port_probe
+            # Only store rest_url when /infos/version returned valid JSON (has_api); never store 404 or webpage URL
+            rest_url_to_store = (rest_url or "") if has_api else ""
             await update_node_port_statuses(
-                db_path, host, port,
+                db_path, address, port,
                 rest_port=first_rest_port,
                 rest_status=PORT_STATUS_REACHABLE if has_api else PORT_STATUS_CLOSED,
-                rest_url=rest_url or "",
+                rest_url=rest_url_to_store,
             )
-            await update_node_status_from_port_statuses(db_path, host, port)
+            await update_node_status_from_port_statuses(db_path, address, port)
             await update_node_enrichment(
-                db_path, host, port,
+                db_path, address, port,
                 has_api=has_api,
                 cert_domains=cert_domains if cert_domains else None,
             )
@@ -307,8 +323,8 @@ async def _phase3_client_synced(
                     break
             now = time.time()
             discovery_status = PORT_STATUS_REACHABLE if discovery_reachable else PORT_STATUS_CLOSED
-            await upsert_node_port(db_path, host, port, port, PORT_TYPE_DISCOVERY, discovery_status, now)
-            await update_node_port_statuses(db_path, host, port, discovery_status=discovery_status)
+            await upsert_node_port(db_path, address, port, port, PORT_TYPE_DISCOVERY, discovery_status, now)
+            await update_node_port_statuses(db_path, address, port, discovery_status=discovery_status)
 
             # Broker: try 9973 then 19140 (and current port first); store working broker_port
             ports_to_try = list(dict.fromkeys([port] + BROKER_PORTS_TO_TRY))
@@ -324,11 +340,11 @@ async def _phase3_client_synced(
                     pass
             broker_reachable = working_broker_port is not None
             status_broker = PORT_STATUS_REACHABLE if broker_reachable else PORT_STATUS_CLOSED
-            await upsert_node_port(db_path, host, port, port, PORT_TYPE_BROKER, status_broker, now)
+            await upsert_node_port(db_path, address, port, port, PORT_TYPE_BROKER, status_broker, now)
             if broker_reachable and working_broker_port is not None:
-                await update_node_port_statuses(db_path, host, port, broker_port=working_broker_port, broker_status=status_broker)
+                await update_node_port_statuses(db_path, address, port, broker_port=working_broker_port, broker_status=status_broker)
             else:
-                await update_node_port_statuses(db_path, host, port, broker_status=status_broker)
+                await update_node_port_statuses(db_path, address, port, broker_status=status_broker)
             canonical_port = working_broker_port if working_broker_port is not None else port
 
             client_id_raw: Optional[str] = broker_ok if broker_reachable else None
@@ -378,14 +394,14 @@ async def _phase3_client_synced(
                 os_str = client_parsed.os
 
             await update_node_enrichment(
-                db_path, host, canonical_port,
+                db_path, address, canonical_port,
                 version=version_str,
                 synced=synced,
                 chain_heights=chain_heights,
                 client=client_str,
                 os=os_str,
             )
-            await update_node_status_from_port_statuses(db_path, host, canonical_port)
+            await update_node_status_from_port_statuses(db_path, address, canonical_port)
             if (i + 1) % 50 == 0:
                 logger.info("Phase 3 (client/synced): %d/%d nodes", i + 1, len(nodes))
             await asyncio.sleep(DELAY_BETWEEN_NODES_SEC)
@@ -422,21 +438,24 @@ async def _phase4_neighbors(
     async def add_node_if_new(addr: str, p: int) -> None:
         if not addr or p <= 0:
             return
-        host = addr
-        if not host.replace(".", "").replace(":", "").isdigit():
-            ip = await _resolve_host(host, p)
-            if ip:
-                host = ip
-        key = (host, p)
+        # Keep hostname in DB: use addr (as reported) as address; resolve only for network calls / dedup
+        key = (addr, p)
         if key in added:
             return
         added.add(key)
-        await revive_if_dead(db_path, host, p)
-        if addr != host:
-            await revive_if_dead(db_path, addr, p)
+        # Don't overwrite an existing node's port with default 9973 (e.g. from inter-clique)
+        existing = await get_node_by_address(db_path, addr)
+        if existing is not None and p == 9973:
+            p = int(existing["port"])
+        await revive_if_unreachable(db_path, addr, p)
+        resolved_ip = None
+        if not addr.replace(".", "").replace(":", "").isdigit():
+            resolved_ip = await _resolve_host(addr, p)
+            if resolved_ip:
+                await revive_if_unreachable(db_path, resolved_ip, p)
         await upsert_node(
-            db_path, host, p,
-            domain=addr if addr != host else None,
+            db_path, addr, p,
+            domain=resolved_ip if resolved_ip else None,
             status="offline",
             last_explored=0.0,
             preserve_status=True,

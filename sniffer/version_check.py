@@ -16,6 +16,9 @@ logger = logging.getLogger(__name__)
 # Ports to try for REST (linear daemon: after 301, retry redirect host on these)
 REST_PROBE_PORTS = [12973, 80, 443]
 
+# When REST API is reachable, store Swagger doc deep link; otherwise /infos/version is used only for probing
+REST_URL_PATH_REACHABLE = "/docs/#/Infos/getInfosVersion"
+
 
 def _get_ssl_cert_domains_sync(host: str, port: int, timeout: float = 5.0) -> List[str]:
     """Sync: connect to host:port with TLS, return list of DNS names from cert (SAN + CN)."""
@@ -177,6 +180,8 @@ async def try_rest_with_301_and_cert(
     On 301/302: extract Location host and retry with that host on 12973, 80, 443 (http and https).
     On 200 over HTTPS: fetch TLS cert and extract certificate domains (SAN + CN).
     Returns (has_api, version, rest_url, cert_domains).
+    rest_url is only set when GET /infos/version returns 200 with valid Alephium JSON
+    (not 404, not an HTML webpage).
     """
     cert_domains: List[str] = []
     ports_to_try = [rest_port_probe, 80, 443]
@@ -223,14 +228,14 @@ async def try_rest_with_301_and_cert(
             status, version, redir = await do_one(host, port, use_https)
             if status == 200:
                 if port == 443:
-                    rest_url = f"https://{host}/infos/node"
+                    rest_url = f"https://{host}{REST_URL_PATH_REACHABLE}"
                     cert_domains = await get_ssl_cert_domains(host, port, timeout)
                 elif port == 80:
-                    rest_url = f"http://{host}/infos/node"
+                    rest_url = f"http://{host}{REST_URL_PATH_REACHABLE}"
                 else:
-                    rest_url = f"http://{host}:{port}/infos/node"
+                    rest_url = f"http://{host}:{port}{REST_URL_PATH_REACHABLE}"
                     if use_https:
-                        rest_url = f"https://{host}:{port}/infos/node"
+                        rest_url = f"https://{host}:{port}{REST_URL_PATH_REACHABLE}"
                         cert_domains = await get_ssl_cert_domains(host, port, timeout)
                 return (True, version, rest_url, cert_domains)
             if redir and redir[0] not in seen_redirect_hosts:
@@ -243,14 +248,14 @@ async def try_rest_with_301_and_cert(
                 status, version, _ = await do_one(redir_host, port, use_https)
                 if status == 200:
                     if port == 443:
-                        rest_url = f"https://{redir_host}/infos/node"
+                        rest_url = f"https://{redir_host}{REST_URL_PATH_REACHABLE}"
                         cert_domains = await get_ssl_cert_domains(redir_host, port, timeout)
                     elif port == 80:
-                        rest_url = f"http://{redir_host}/infos/node"
+                        rest_url = f"http://{redir_host}{REST_URL_PATH_REACHABLE}"
                     else:
-                        rest_url = f"http://{redir_host}:{port}/infos/node"
+                        rest_url = f"http://{redir_host}:{port}{REST_URL_PATH_REACHABLE}"
                         if use_https:
-                            rest_url = f"https://{redir_host}:{port}/infos/node"
+                            rest_url = f"https://{redir_host}:{port}{REST_URL_PATH_REACHABLE}"
                             cert_domains = await get_ssl_cert_domains(redir_host, port, timeout)
                     return (True, version, rest_url, cert_domains)
 
