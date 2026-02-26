@@ -680,3 +680,26 @@ def ping_reply_pong(host: str, port: int, network_id: int, timeout: float = 5.0)
             sock.close()
         except OSError:
             pass
+
+
+def findnode_reply_neighbors(host: str, port: int, network_id: int, timeout: float = 5.0) -> bool:
+    """
+    Send a single UDP FindNode to host:port and return True if a Neighbors response is received.
+    Many nodes respond to FindNode but not to Ping or Broker TCP. Blocking; run in executor if needed.
+    """
+    import os as _os
+    msg = build_find_node_message(network_id, _os.urandom(33))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(msg, (host, port))
+        raw, _ = sock.recvfrom(65535)
+        payload_type, _ = get_response_payload_type(raw, network_id)
+        return payload_type == CODE_NEIGHBORS
+    except (socket.timeout, OSError):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

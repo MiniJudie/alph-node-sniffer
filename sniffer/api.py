@@ -3,7 +3,7 @@ import csv
 import io
 import json
 import logging
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
@@ -120,12 +120,15 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         tags=["Status"],
         summary="List all nodes as host:port -> status",
         description="Returns a map of '<address>:<port>' to status (online, offline, dead). Optional status filter.",
+        response_model=Dict[str, str],
+        responses={200: {"description": "Map of '<host>:<port>' to status (online, offline, dead)"}},
+        operation_id="get_status_node",
     )
     async def status_node(
         status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
     ):
         """Returns { '<host>:<port>': '<status>', ... }. Use status query to filter (e.g. ?status=online)."""
-        out = {}
+        out: Dict[str, str] = {}
         async for node in get_nodes(db_path, status=status):
             key = f"{node['address']}:{node['port']}"
             out[key] = node["status"]

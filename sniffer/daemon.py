@@ -26,6 +26,7 @@ from sniffer.db import (
     get_max_network_heights,
     get_node_geo_dns,
     get_all_nodes_list,
+    get_node_by_address,
     init_db,
     increment_misbehavior_count,
     update_node_enrichment,
@@ -45,6 +46,7 @@ from sniffer.geo import geolocate
 from sniffer.lookup import reverse_dns_and_whois
 from sniffer.protocol import (
     build_find_node_message,
+    findnode_reply_neighbors,
     ping_reply_pong,
     extract_neighbors_from_message,
 )
@@ -82,6 +84,9 @@ PHASE2_SEMAPHORE = 10  # REST probes
 PHASE3_SEMAPHORE = 5   # UDP/TCP per node
 PHASE4_SEMAPHORE = 5   # FindNode / REST neighbors
 DELAY_BETWEEN_NODES_SEC = 0.3  # avoid burst on external APIs
+
+# Broker ports to try when probing a node (9973 standard, 19140 common alternative)
+BROKER_PORTS_TO_TRY = [9973, 19140]
 
 
 async def _resolve_host(host: str, port: int) -> Optional[str]:
@@ -276,28 +281,55 @@ async def _phase3_client_synced(
             display = _display_node(host, node.get("domain"))
             logger.info("Phase 3 [%d/%d]: testing %s (%s:%s)", i + 1, len(nodes), display, host, port)
 
-            # Discovery: ping -> pong
-            try:
-                pong = await loop.run_in_executor(
-                    None,
-                    lambda h=host, p=port: ping_reply_pong(h, p, network_id, timeout_udp),
-                )
-            except Exception:
-                pong = False
+            # Ports to try for discovery and broker: current first, then 9973, then 19140
+            ports_to_try = list(dict.fromkeys([port] + BROKER_PORTS_TO_TRY))
+
+            # Discovery: try FindNode first then Ping on each port until one responds
+            discovery_reachable = False
+            for p in ports_to_try:
+                try:
+                    discovery_reachable = await loop.run_in_executor(
+                        None,
+                        lambda h=host, pt=p: findnode_reply_neighbors(h, pt, network_id, timeout_udp),
+                    )
+                except Exception:
+                    pass
+                if discovery_reachable:
+                    break
+                try:
+                    discovery_reachable = await loop.run_in_executor(
+                        None,
+                        lambda h=host, pt=p: ping_reply_pong(h, pt, network_id, timeout_udp),
+                    )
+                except Exception:
+                    pass
+                if discovery_reachable:
+                    break
             now = time.time()
-            discovery_status = PORT_STATUS_REACHABLE if pong else PORT_STATUS_CLOSED
+            discovery_status = PORT_STATUS_REACHABLE if discovery_reachable else PORT_STATUS_CLOSED
             await upsert_node_port(db_path, host, port, port, PORT_TYPE_DISCOVERY, discovery_status, now)
             await update_node_port_statuses(db_path, host, port, discovery_status=discovery_status)
 
-            # Broker: TCP Hello
-            try:
-                broker_ok = await get_client_version_tcp(host, port, network_id, timeout=4.0)
-                broker_reachable = broker_ok is not None
-            except Exception:
-                broker_reachable = False
+            # Broker: try 9973 then 19140 (and current port first); store working broker_port
+            ports_to_try = list(dict.fromkeys([port] + BROKER_PORTS_TO_TRY))
+            working_broker_port: Optional[int] = None
+            broker_ok = None
+            for p in ports_to_try:
+                try:
+                    broker_ok = await get_client_version_tcp(host, p, network_id, timeout=4.0)
+                    if broker_ok is not None:
+                        working_broker_port = p
+                        break
+                except Exception:
+                    pass
+            broker_reachable = working_broker_port is not None
             status_broker = PORT_STATUS_REACHABLE if broker_reachable else PORT_STATUS_CLOSED
             await upsert_node_port(db_path, host, port, port, PORT_TYPE_BROKER, status_broker, now)
-            await update_node_port_statuses(db_path, host, port, broker_port=port, broker_status=status_broker)
+            if broker_reachable and working_broker_port is not None:
+                await update_node_port_statuses(db_path, host, port, broker_port=working_broker_port, broker_status=status_broker)
+            else:
+                await update_node_port_statuses(db_path, host, port, broker_status=status_broker)
+            canonical_port = working_broker_port if working_broker_port is not None else port
 
             client_id_raw: Optional[str] = broker_ok if broker_reachable else None
             synced: Optional[bool] = None
@@ -318,8 +350,8 @@ async def _phase3_client_synced(
             if chain_heights is None or client_id_raw is None or synced is None:
                 try:
                     cs = await get_chain_state_tcp(
-                        host, port, network_id, timeout=8.0,
-                        broker_port=port, reference_nodes=reference_nodes, reference_broker_port=None,
+                        host, canonical_port, network_id, timeout=8.0,
+                        broker_port=canonical_port, reference_nodes=reference_nodes, reference_broker_port=None,
                     )
                     if cs is not None:
                         if chain_heights is None and cs.tips:
@@ -346,14 +378,14 @@ async def _phase3_client_synced(
                 os_str = client_parsed.os
 
             await update_node_enrichment(
-                db_path, host, port,
+                db_path, host, canonical_port,
                 version=version_str,
                 synced=synced,
                 chain_heights=chain_heights,
                 client=client_str,
                 os=os_str,
             )
-            await update_node_status_from_port_statuses(db_path, host, port)
+            await update_node_status_from_port_statuses(db_path, host, canonical_port)
             if (i + 1) % 50 == 0:
                 logger.info("Phase 3 (client/synced): %d/%d nodes", i + 1, len(nodes))
             await asyncio.sleep(DELAY_BETWEEN_NODES_SEC)
@@ -470,8 +502,10 @@ async def _phase4_neighbors(
                     if misbehaviors:
                         for peer_str in misbehaviors:
                             peer_host = await _resolve_host(peer_str, 9973) or peer_str
-                            await add_node_if_new(peer_host, 9973)
-                            await increment_misbehavior_count(db_path, peer_host)
+                            existing = await get_node_by_address(db_path, peer_host)
+                            if existing is None:
+                                await add_node_if_new(peer_host, 9973)
+                            await increment_misbehavior_count(db_path, existing["address"] if existing else peer_host)
                         logger.info("Phase 4 [%d/%d] REST misbehaviors from %s: %d peers (added to neighbor list) %s", i + 1, len(nodes), display, len(misbehaviors), misbehaviors[:10])
                 except Exception:
                     pass
@@ -494,6 +528,14 @@ async def run_linear_cycle(config: Config, db_path: str) -> None:
 
     # 1. Load all hosts into memory
     nodes = await get_all_nodes_list(db_path)
+    if not nodes and config.starting_nodes:
+        logger.info("No nodes in DB; seeding %d starting_nodes from config", len(config.starting_nodes))
+        for s in config.starting_nodes:
+            if not (s and str(s).strip()):
+                continue
+            host, port = config.parse_node(str(s).strip())
+            await upsert_node(db_path, host, port, status="offline", last_explored=0.0)
+        nodes = await get_all_nodes_list(db_path)
     if not nodes:
         logger.warning("No nodes in DB; linear cycle has nothing to do")
         return
