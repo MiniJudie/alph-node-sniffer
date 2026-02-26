@@ -276,10 +276,13 @@ async def _phase2_rest_probe(
                 rest_url=rest_url_to_store,
             )
             await update_node_status_from_port_statuses(db_path, address, port)
+            # Fill version from REST when we have it; do not pass version when missing so we do not override existing
+            enrichment_kw: Dict[str, Any] = dict(has_api=has_api, cert_domains=cert_domains if cert_domains else None)
+            if version and isinstance(version, str) and version.strip():
+                enrichment_kw["version"] = version.strip()
             await update_node_enrichment(
                 db_path, address, port,
-                has_api=has_api,
-                cert_domains=cert_domains if cert_domains else None,
+                **enrichment_kw,
             )
             if (i + 1) % 100 == 0:
                 logger.info("Phase 2 (REST): %d/%d nodes", i + 1, len(nodes))
@@ -400,22 +403,36 @@ async def _phase3_client_synced(
                     synced = True
 
             client_parsed = parse_client_id(client_id_raw) if client_id_raw else None
-            version_str = node.get("version")
+            version_str: Optional[str] = node.get("version")  # keep existing if we do not get a new one
             client_str: Optional[str] = None
             os_str: Optional[str] = None
             if client_parsed:
-                if client_parsed.version is not None:
-                    version_str = client_parsed.version
+                if client_parsed.version is not None and str(client_parsed.version).strip():
+                    version_str = str(client_parsed.version).strip()
                 client_str = client_parsed.client
                 os_str = client_parsed.os
 
-            await update_node_enrichment(
-                db_path, address, canonical_port,
-                version=version_str,
+            # If still no version and node has REST, try to get version from REST
+            if (not version_str or not version_str.strip()) and node.get("has_api") and rest_port:
+                try:
+                    _, rest_version = await check_rest_api(host, rest_port, timeout=3.0)
+                    if rest_version and str(rest_version).strip():
+                        version_str = str(rest_version).strip()
+                except Exception:
+                    pass
+
+            # Only pass version when we have a value so we do not override existing
+            update_kw: Dict[str, Any] = dict(
                 synced=synced,
                 chain_heights=chain_heights,
                 client=client_str,
                 os=os_str,
+            )
+            if version_str and version_str.strip():
+                update_kw["version"] = version_str.strip()
+            await update_node_enrichment(
+                db_path, address, canonical_port,
+                **update_kw,
             )
             await update_node_status_from_port_statuses(db_path, address, canonical_port)
             if (i + 1) % 50 == 0:
