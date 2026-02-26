@@ -497,6 +497,7 @@ async def ensure_node_in_db(db_path: str, address: str, port: int, from_neighbor
         domain=address if address != host else None,
         status="offline",
         last_explored=0.0,
+        preserve_status=True,
     )
 
 
@@ -718,6 +719,7 @@ async def _process_and_store_node_impl(
         chain_heights=chain_heights,
         client=client_str,
         os=os_str,
+        preserve_status=True,
     )
     logger.info("Node %s:%s version=%s client=%s os=%s country=%s has_api=%s synced=%s", _display_node(host, info.address if info.address != host else None), port, version_str, client_str, os_str, country, has_api, synced)
 

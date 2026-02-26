@@ -78,6 +78,15 @@ async def push_nodes_to_bigquery(
     if not project or not dataset or not table:
         return
 
+    try:
+        from google.cloud import bigquery  # noqa: F401
+    except ImportError as e:
+        logger.warning(
+            "BigQuery push skipped: %s. Install with: pip install google-cloud-bigquery",
+            e,
+        )
+        return
+
     from sniffer.db import get_nodes
 
     rows: List[Dict[str, Any]] = []

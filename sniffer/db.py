@@ -260,8 +260,9 @@ async def upsert_node(
     chain_heights: Optional[List[int]] = None,
     client: Optional[str] = None,
     os: Optional[str] = None,
+    preserve_status: bool = False,
 ) -> None:
-    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. clique_id is hex string (66 chars). chain_heights: JSON array of 16 heights from broker ChainState. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
+    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. If preserve_status=True, on conflict do not overwrite status (used by enrichment to keep port-derived online/offline). clique_id is hex string (66 chars). chain_heights: JSON array of 16 heights from broker ChainState. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
     now = time.time()
     st = status or STATUS_OFFLINE
     fse = first_seen if first_seen is not None else now
@@ -288,7 +289,7 @@ async def upsert_node(
                 continent = COALESCE(excluded.continent, continent),
                 has_api = excluded.has_api OR has_api,
                 synced = COALESCE(excluded.synced, synced),
-                status = excluded.status,
+                status = CASE WHEN ? THEN nodes.status ELSE excluded.status END,
                 last_seen = CASE WHEN excluded.last_seen > 0 THEN excluded.last_seen ELSE nodes.last_seen END,
                 first_seen = nodes.first_seen,
                 last_explored = nodes.last_explored,
@@ -330,6 +331,7 @@ async def upsert_node(
                 json.dumps(chain_heights) if chain_heights is not None else None,
                 client,
                 os,
+                1 if preserve_status else 0,
             ),
         )
         await db.commit()
