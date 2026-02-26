@@ -16,12 +16,18 @@ Encoding verification (vs Alephium):
 """
 import socket
 import struct
+import time
 import hashlib
+import logging
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 # Discovery version used by the network (Alephium CurrentDiscoveryVersion = Bytes.toIntUnsafe(ByteString(0,1,0,0)) = 65536)
 CURRENT_DISCOVERY_VERSION = 65536
+# Valid broker Hello clientId fallback when no reference node is available (node may ban invalid clientId).
+BROKER_HELLO_CLIENT_ID_FALLBACK = "scala-alephium/v4.3.1/Linux/p2p-v2"
 # Payload type codes: Ping=0, Pong=1, FindNode=2, Neighbors=3
 CODE_NEIGHBORS = 3
 # Secp256k1 signature size
@@ -317,6 +323,268 @@ def parse_tcp_hello_client_id(data: bytes) -> Optional[str]:
         return None
 
 
+def parse_tcp_payload_code_and_payload(data: bytes) -> Tuple[int, bytes]:
+    """
+    Parse TCP broker message data (after unwrap).
+    data = header (WireVersion compact int) + code (compact int) + payload_bytes.
+    Returns (code, payload_bytes).
+    """
+    pos = 0
+    _, n = decode_compact_int(data)
+    pos += n
+    if pos >= len(data):
+        raise ValueError("no code")
+    code, n = decode_compact_int(data[pos:])
+    pos += n
+    return (code, data[pos:])
+
+
+# Broker payload codes (Payload.Code): Hello=0, ..., ChainState=16
+CODE_HELLO = 0
+CODE_CHAIN_STATE = 16
+BLOCK_HASH_LENGTH = 32
+
+
+def parse_chain_tip(data: bytes) -> Tuple[bytes, int, int]:
+    """
+    Parse one ChainTip: hash(32) + height(compact int) + weight(BigInteger = length-prefixed bytes).
+    Returns (hash_bytes, height, bytes_consumed).
+    """
+    if len(data) < BLOCK_HASH_LENGTH:
+        raise ValueError("data too short for ChainTip")
+    h = data[:BLOCK_HASH_LENGTH]
+    pos = BLOCK_HASH_LENGTH
+    height, n = decode_compact_int(data[pos:])
+    pos += n
+    weight_len, n = decode_compact_int(data[pos:])
+    pos += n
+    if weight_len < 0 or pos + weight_len > len(data):
+        raise ValueError("invalid weight length in ChainTip")
+    pos += weight_len
+    return (h, height, pos)
+
+
+def parse_chain_state_payload(payload: bytes) -> List[Tuple[bytes, int]]:
+    """
+    Parse ChainState payload: AVector[ChainTip] = length (compact int) + ChainTip list.
+    Returns list of (hash_bytes, height).
+    """
+    if not payload:
+        return []
+    count, pos = decode_compact_int(payload)
+    if count < 0:
+        return []
+    tips = []
+    rest = payload[pos:]
+    for _ in range(count):
+        h, height, n = parse_chain_tip(rest)
+        tips.append((h, height))
+        rest = rest[n:]
+    return tips
+
+
+def build_hello_message(
+    network_id: int,
+    client_id: str,
+    clique_id: bytes,
+    broker_id: int,
+    broker_num: int,
+    private_key_bytes: bytes,
+) -> bytes:
+    """
+    Build broker Hello message. clique_id: 33 bytes, private_key_bytes: 32 bytes (secp256k1).
+    """
+    import hashlib as _hashlib
+    from ecdsa import SigningKey, SECP256k1
+
+    def _sigencode_canonical(r: int, s: int, order: int) -> bytes:
+        """Encode (r, s) as 64 bytes: 32-byte r + 32-byte s, big-endian. Alephium requires s <= order/2 (low-S)."""
+        half_order = order >> 1
+        if s > half_order:
+            s = order - s
+        return r.to_bytes(32, "big") + s.to_bytes(32, "big")
+
+    if len(clique_id) != 33 or len(private_key_bytes) != 32:
+        raise ValueError("clique_id must be 33 bytes, private_key 32 bytes")
+    inter_broker_bytes = (
+        clique_id + encode_compact_int(broker_id) + encode_compact_int(broker_num)
+    )
+    to_sign = _hashlib.blake2b(inter_broker_bytes, digest_size=32).digest()
+    sk = SigningKey.from_string(private_key_bytes, curve=SECP256k1)
+    sig = sk.sign_digest(to_sign, sigencode=_sigencode_canonical)
+    if len(sig) != 64:
+        raise ValueError("expected 64-byte signature")
+    ts_ms = int(time.time() * 1000)
+    client_id_utf = client_id.encode("utf-8")
+    # Alephium TimeStamp is 8-byte big-endian Long (Bytes.from(millis)), not compact int
+    ts_bytes = struct.pack(">q", ts_ms)
+    hello_payload = (
+        encode_compact_int(len(client_id_utf))
+        + client_id_utf
+        + ts_bytes
+        + inter_broker_bytes
+        + sig
+    )
+    magic = magic_bytes(network_id)
+    wire_version = 65536
+    data = encode_compact_int(wire_version) + encode_compact_int(CODE_HELLO) + hello_payload
+    msg_checksum = checksum(data)
+    msg_length = struct.pack(">I", len(data))
+    return magic + msg_checksum + msg_length + data
+
+
+def _read_one_tcp_frame(sock: socket.socket, magic: bytes, timeout: float) -> Optional[bytes]:
+    """Read one broker TCP frame. Returns unwrapped data or None."""
+    sock.settimeout(timeout)
+    header = sock.recv(12)
+    if len(header) < 12:
+        return None
+    if header[:4] != magic:
+        return None
+    msg_len = int.from_bytes(header[8:12], "big")
+    if msg_len <= 0 or msg_len > 0x100000:
+        return None
+    rest = b""
+    while len(rest) < msg_len:
+        chunk = sock.recv(min(8192, msg_len - len(rest)))
+        if not chunk:
+            return None
+        rest += chunk
+    raw = header + rest
+    return unwrap_message(raw, magic)
+
+
+def _get_client_id_from_reference_nodes(
+    reference_nodes: List[Tuple[str, int]],
+    reference_broker_port: Optional[int],
+    network_id: int,
+    timeout: float = 5.0,
+) -> Optional[str]:
+    """
+    Connect to the first available reference node's broker, read Hello, return its clientId.
+    reference_nodes: list of (host, discovery_port). reference_broker_port: broker port to use (or use discovery port per node).
+    """
+    for ref_host, ref_port in reference_nodes:
+        port = reference_broker_port if reference_broker_port is not None else ref_port
+        logger.info("Getting clientId from reference node %s:%s ...", ref_host, port)
+        cid = fetch_client_version_tcp(ref_host, port, network_id, timeout)
+        if cid and "/" in cid:
+            logger.info("Using clientId from reference: %s", cid)
+            return cid
+        logger.info("Reference %s:%s did not respond or invalid clientId", ref_host, port)
+    logger.info("No reference node responded; using fallback clientId")
+    return None
+
+
+def fetch_chain_state_tcp(
+    host: str,
+    discovery_port: int,
+    network_id: int,
+    timeout: float = 10.0,
+    broker_port: Optional[int] = None,
+    reference_nodes: Optional[List[Tuple[str, int]]] = None,
+    reference_broker_port: Optional[int] = None,
+) -> Optional[Tuple[Optional[str], bool, List[Tuple[bytes, int]]]]:
+    """
+    Connect to node's broker TCP, perform handshake, read ChainState.
+    Uses clientId from reference_nodes (connect to one, read its Hello) so the target node accepts us.
+    Falls back to BROKER_HELLO_CLIENT_ID_FALLBACK if no reference nodes or all fail.
+    Returns (client_id, synced, tips) where tips = [(hash, height), ...], or None on failure.
+    synced is always None from broker ChainState (cannot be derived from partial tips; use REST /infos/self-clique-synced for real synced).
+    """
+    hello_client_id = None
+    if reference_nodes:
+        hello_client_id = _get_client_id_from_reference_nodes(
+            reference_nodes, reference_broker_port, network_id, min(timeout, 5.0)
+        )
+    if not hello_client_id:
+        hello_client_id = BROKER_HELLO_CLIENT_ID_FALLBACK
+        logger.info("Using fallback clientId: %s", hello_client_id)
+    port = broker_port if broker_port is not None else discovery_port
+    magic = magic_bytes(network_id)
+    try:
+        logger.info("Connecting to target %s:%s (broker) ...", host, port)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((host, port))
+        try:
+            data = _read_one_tcp_frame(sock, magic, timeout)
+            if not data:
+                logger.warning("No data received from target (connection closed or timeout)")
+                return None
+            client_id = parse_tcp_hello_client_id(data)
+            code, payload = parse_tcp_payload_code_and_payload(data)
+            if code != CODE_HELLO:
+                logger.warning("Target sent unexpected message type %s (expected Hello=0)", code)
+                return None
+            logger.info("Received Hello from target, clientId=%s", client_id or "(none)")
+            try:
+                from ecdsa import SigningKey, SECP256k1
+
+                priv = SigningKey.generate(curve=SECP256k1)
+                vk = priv.get_verifying_key()
+                point = vk.pubkey.point
+                x = point.x().to_bytes(32, "big")
+                y_parity = int(point.y()) & 1
+                pub = bytes([2 + y_parity]) + x
+                hello_msg = build_hello_message(
+                    network_id, hello_client_id, pub, 0, 4, priv.to_string()
+                )
+                sock.sendall(hello_msg)
+                logger.info("Sent our Hello (clientId=%s), waiting for ChainState ...", hello_client_id)
+            except Exception as e:
+                logger.warning("Failed to build/send Hello: %s", e)
+                return None
+            tips: List[Tuple[bytes, int]] = []
+            read_timeout = min(timeout, 5.0)
+            deadline = time.time() + timeout
+            last_log = 0.0
+            while True:
+                try:
+                    data = _read_one_tcp_frame(sock, magic, read_timeout)
+                except socket.timeout:
+                    now = time.time()
+                    if now >= deadline:
+                        logger.warning("Timeout waiting for ChainState (node sends it on sync interval)")
+                        break
+                    if now - last_log >= 5.0:
+                        logger.info("Still waiting for ChainState (%.0fs left) ...", deadline - now)
+                        last_log = now
+                    continue
+                except OSError as e:
+                    logger.warning("Connection closed or error while waiting for ChainState: %s", e)
+                    break
+                if not data:
+                    now = time.time()
+                    if now >= deadline:
+                        logger.warning("Timeout waiting for ChainState (node sends it on sync interval)")
+                        break
+                    if now - last_log >= 5.0:
+                        logger.info("Still waiting for ChainState (%.0fs left) ...", deadline - now)
+                        last_log = now
+                    continue
+                try:
+                    code, payload = parse_tcp_payload_code_and_payload(data)
+                    if code == CODE_CHAIN_STATE:
+                        tips = parse_chain_state_payload(payload)
+                        logger.info("Received ChainState with %s tips", len(tips))
+                        break
+                    logger.info("Received message type %s (waiting for ChainState=16), continuing ...", code)
+                except (ValueError, IndexError) as e:
+                    logger.info("Could not parse message: %s", e)
+            if not tips:
+                return (client_id, None, [])
+            return (client_id, None, tips)
+        finally:
+            try:
+                sock.close()
+            except OSError:
+                pass
+    except OSError:
+        return None
+    return None
+
+
 def fetch_client_version_tcp(
     host: str, port: int, network_id: int, timeout: float = 5.0
 ) -> Optional[str]:
@@ -374,3 +642,31 @@ def build_ping_message(network_id: int, session_id: bytes) -> bytes:
     msg_checksum = checksum(data)
     msg_length = struct.pack(">I", len(data))
     return magic + msg_checksum + msg_length + data
+
+
+# Pong payload type code
+CODE_PONG = 1
+
+
+def ping_reply_pong(host: str, port: int, network_id: int, timeout: float = 5.0) -> bool:
+    """
+    Send a single UDP Ping to host:port and return True if a Pong is received.
+    Blocking; run in executor if needed. Used to determine if node is online (discovery reachable).
+    """
+    import os as _os
+    session_id = _os.urandom(32)
+    msg = build_ping_message(network_id, session_id)
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.settimeout(timeout)
+    try:
+        sock.sendto(msg, (host, port))
+        raw, _ = sock.recvfrom(4096)
+        payload_type, _ = get_response_payload_type(raw, network_id)
+        return payload_type == CODE_PONG
+    except (socket.timeout, OSError):
+        return False
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass

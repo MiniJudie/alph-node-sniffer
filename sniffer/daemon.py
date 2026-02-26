@@ -11,13 +11,26 @@ from typing import List, Optional, Set, Tuple
 
 from sniffer.config import Config
 from sniffer.db import (
+    _heights_within_threshold_of_max,
+    get_max_network_heights,
+    get_node_geo_dns,
     init_db,
     upsert_node,
+    update_node_enrichment,
     mark_exploration_success,
     mark_exploration_failed,
     get_nodes_to_explore,
     get_nodes_without_version,
     revive_if_dead,
+    update_synced_for_clique_peers,
+    upsert_node_port,
+    update_node_port_statuses,
+    update_node_status_from_port_statuses,
+    PORT_STATUS_REACHABLE,
+    PORT_STATUS_CLOSED,
+    PORT_TYPE_DISCOVERY,
+    PORT_TYPE_BROKER,
+    PORT_TYPE_REST,
 )
 from sniffer.geo import geolocate
 from sniffer.lookup import reverse_dns_and_whois
@@ -29,8 +42,19 @@ from sniffer.protocol import (
     extract_neighbors_from_message,
     get_response_payload_type,
     magic_bytes,
+    ping_reply_pong,
 )
-from sniffer.version_check import check_rest_api, check_synced, get_client_version_tcp
+from sniffer.version_check import (
+    check_rest_api,
+    fetch_chain_heights_rest,
+    fetch_inter_clique_peer_info,
+    fetch_self_clique,
+    _try_port,
+    get_client_version_tcp,
+    get_chain_state_tcp,
+    parse_client_id,
+    _try_port,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -312,66 +336,156 @@ async def discover_from_node(
 
 async def enrich_node(config: Config, db_path: str, address: str, port: int, *, display_name: Optional[str] = None) -> None:
     """Resolve, fetch geolocation and REST version, update DB. Safe to call in background. display_name used in logs when provided."""
-    from sniffer.db import update_node_enrichment
+    async with _ENRICH_SEMAPHORE:
+        await _enrich_node_impl(config, db_path, address, port, display_name=display_name)
+
+
+async def _enrich_node_impl(config: Config, db_path: str, address: str, port: int, *, display_name: Optional[str] = None) -> None:
+    """Internal: actual enrichment logic. Called under _ENRICH_SEMAPHORE."""
     host = address
     if not host.replace(".", "").replace(":", "").isdigit():
-        try:
-            resolved = await asyncio.get_event_loop().getaddrinfo(
-                host, port, type=socket.SOCK_DGRAM
-            )
-            if resolved:
-                host = resolved[0][4][0]
-        except Exception:
-            pass
-    country, city, continent, country_code, isp, org = await geolocate(host)
-    reverse_dns_name, hoster = await reverse_dns_and_whois(host)
-    has_api, version = await check_rest_api(host, config.rest_port_probe)
+        ip = await _resolve_host(host, port)
+        if ip:
+            host = ip
+    existing = await get_node_geo_dns(db_path, host)
+    if existing:
+        country, city, continent, country_code, isp, org, zip_val, lat, lon, reverse_dns_name, hoster = existing
+        has_geo = country is not None or city is not None or isp is not None
+        has_dns = reverse_dns_name is not None or hoster is not None
+    else:
+        has_geo, has_dns = False, False
+        country = city = continent = country_code = isp = org = zip_val = reverse_dns_name = hoster = None
+        lat = lon = None
+    if not has_geo:
+        country, city, continent, country_code, isp, org, zip_val, lat, lon = await geolocate(host)
+    if not has_dns:
+        reverse_dns_name, hoster = await reverse_dns_and_whois(host)
+    has_api, version = await check_rest_api(host, config.rest_port_probe, timeout=2.0)
+    client_id_raw: Optional[str] = None
     if version is None:
         try:
             version = await get_client_version_tcp(
-                host, config.broker_port, config.network_id, timeout=5.0
+                host, port, config.network_id, timeout=5.0
+            )
+            if version is not None:
+                client_id_raw = version
+        except Exception:
+            pass
+    if client_id_raw is None:
+        try:
+            client_id_raw = await get_client_version_tcp(
+                host, port, config.network_id, timeout=5.0
             )
         except Exception:
             pass
     synced: Optional[bool] = None
     if has_api:
         try:
-            synced = await check_synced(host, config.rest_port_probe, timeout=5.0)
+            self_clique = await fetch_self_clique(host, config.rest_port_probe, timeout=5.0)
+            if self_clique is not None:
+                synced, peer_addresses = self_clique
+                if peer_addresses:
+                    updated = await update_synced_for_clique_peers(db_path, peer_addresses, synced)
+                    if updated:
+                        logger.debug("Updated synced=%s for %s clique peer(s)", synced, updated)
+            inter_peers = await fetch_inter_clique_peer_info(host, config.rest_port_probe, timeout=5.0)
+            if inter_peers:
+                added = 0
+                for addr in inter_peers:
+                    ok, _ = await _try_port(addr, 9973, timeout=2.0)
+                    if ok:
+                        await ensure_node_in_db(db_path, addr, 9973)
+                        added += 1
+                    resp = await discover_from_node(config, addr, 9973, config.network_id)
+                    if resp:
+                        await ensure_node_in_db(db_path, addr, 9973)
+                        added += 1
+                        for info in resp:
+                            await ensure_node_in_db(db_path, info.address, info.port)
+                            asyncio.create_task(process_and_store_node(config, db_path, info))
+                if added > 0:
+                    logger.debug("Added inter-clique peer(s) from REST+FindNode for next iteration")
         except Exception:
             pass
+    chain_heights: Optional[List[int]] = None
+    if has_api:
+        try:
+            groups = 4 if config.network_id == 0 else 2
+            chain_heights = await fetch_chain_heights_rest(
+                host, config.rest_port_probe, groups=groups, timeout=3.0
+            )
+        except Exception:
+            pass
+    if chain_heights is None:
+        ref_list = config.reference_nodes or (
+            DEFAULT_MAINNET if config.network_id == 0 else DEFAULT_TESTNET
+        )
+        reference_nodes = [config.parse_node(s) for s in ref_list]
+        try:
+            cs = await get_chain_state_tcp(
+                host,
+                port,
+                config.network_id,
+                timeout=8.0,
+                broker_port=port,
+                reference_nodes=reference_nodes,
+                reference_broker_port=None,
+            )
+            if cs is not None:
+                chain_heights = [height for _, height in cs.tips]
+                if synced is None:
+                    synced = cs.synced
+                if client_id_raw is None and cs.client_id:
+                    client_id_raw = cs.client_id
+        except Exception:
+            pass
+    client_parsed = parse_client_id(client_id_raw) if client_id_raw else None
+    version_str = version
+    client_str: Optional[str] = None
+    os_str: Optional[str] = None
+    if client_parsed:
+        if client_parsed.version is not None:
+            version_str = client_parsed.version
+        client_str = client_parsed.client
+        os_str = client_parsed.os
+    if synced is None and chain_heights:
+        max_heights = await get_max_network_heights(db_path)
+        if max_heights and _heights_within_threshold_of_max(chain_heights, max_heights):
+            synced = True
     await update_node_enrichment(
         db_path,
         host,
         port,
         domain=address if address != host else None,
-        version=version,
+        version=version_str,
         country=country,
         city=city,
         continent=continent,
         country_code=country_code,
         isp=isp,
         org=org,
+        zip=zip_val,
+        lat=lat,
+        lon=lon,
         has_api=has_api,
         synced=synced,
         reverse_dns=reverse_dns_name,
         hoster=hoster,
+        chain_heights=chain_heights,
+        client=client_str,
+        os=os_str,
     )
     log_label = display_name if display_name else _display_node(host, address if address != host else None)
-    logger.info("Enriched %s:%s version=%s country=%s has_api=%s synced=%s", log_label, port, version, country, has_api, synced)
+    logger.info("Enriched %s:%s version=%s client=%s os=%s country=%s has_api=%s synced=%s", log_label, port, version_str, client_str, os_str, country, has_api, synced)
 
 
 async def ensure_node_in_db(db_path: str, address: str, port: int, from_neighbors: bool = True) -> None:
     """Ensure node exists in DB with status offline and last_explored=0 so it gets explored. Revive if dead. Resolve hostname to IP for canonical key."""
     host = address
     if not host.replace(".", "").replace(":", "").isdigit():
-        try:
-            resolved = await asyncio.get_event_loop().getaddrinfo(
-                host, port, type=socket.SOCK_DGRAM
-            )
-            if resolved:
-                host = resolved[0][4][0]
-        except Exception:
-            pass
+        ip = await _resolve_host(host, port)
+        if ip:
+            host = ip
     if from_neighbors:
         await revive_if_dead(db_path, address, port)
         if host != address:
@@ -386,39 +500,199 @@ async def ensure_node_in_db(db_path: str, address: str, port: int, from_neighbor
     )
 
 
+async def probe_node_ports(
+    config: Config,
+    db_path: str,
+    address: str,
+    node_port: int,
+    timeout: float = 4.0,
+) -> None:
+    """Probe broker and REST ports for a node, update node_ports table and nodes.broker_port/rest_port/status columns. Uses node's discovery port for broker (same host:port as P2P)."""
+    host = address
+    if not host.replace(".", "").replace(":", "").isdigit():
+        ip = await _resolve_host(host, node_port)
+        if ip:
+            host = ip
+    now = time.time()
+
+    # Broker port: use the node's own port (discovery port = broker port on same host)
+    broker_port = node_port
+    try:
+        broker_ok = await get_client_version_tcp(host, broker_port, config.network_id, timeout=timeout)
+        broker_reachable = broker_ok is not None
+    except Exception:
+        broker_reachable = False
+    status_broker = PORT_STATUS_REACHABLE if broker_reachable else PORT_STATUS_CLOSED
+    await upsert_node_port(db_path, host, node_port, broker_port, PORT_TYPE_BROKER, status_broker, now)
+    await update_node_port_statuses(
+        db_path, host, node_port,
+        broker_port=broker_port,
+        broker_status=status_broker,
+    )
+
+    # REST ports: reachable if GET /infos/version returns 200 (via _try_port)
+    rest_ports = [config.rest_port_probe]
+    if 80 not in rest_ports:
+        rest_ports.append(80)
+    if 443 not in rest_ports:
+        rest_ports.append(443)
+    first_rest_port: Optional[int] = None
+    any_rest_reachable = False
+    for p in rest_ports:
+        try:
+            has_api, _ = await _try_port(host, p, timeout)
+            reachable = has_api
+        except Exception:
+            reachable = False
+        any_rest_reachable = any_rest_reachable or reachable
+        if reachable and first_rest_port is None:
+            first_rest_port = p
+        st = PORT_STATUS_REACHABLE if reachable else PORT_STATUS_CLOSED
+        await upsert_node_port(db_path, host, node_port, p, PORT_TYPE_REST, st, now)
+    rest_url: Optional[str] = None
+    if first_rest_port is not None:
+        if first_rest_port == 443:
+            rest_url = f"https://{host}/infos/node"
+        elif first_rest_port == 80:
+            rest_url = f"http://{host}/infos/node"
+        else:
+            rest_url = f"http://{host}:{first_rest_port}/infos/node"
+    else:
+        rest_url = ""
+    await update_node_port_statuses(
+        db_path, host, node_port,
+        rest_port=first_rest_port,
+        rest_status=PORT_STATUS_REACHABLE if any_rest_reachable else PORT_STATUS_CLOSED,
+        rest_url=rest_url if rest_url is not None else "",
+    )
+
+
 async def process_and_store_node(
     config: Config,
     db_path: str,
     info: BrokerInfo,
 ) -> None:
     """Resolve domain to IP if needed, geolocate, check API, upsert (background enrichment)."""
+    async with _ENRICH_SEMAPHORE:
+        await _process_and_store_node_impl(config, db_path, info)
+
+
+async def _process_and_store_node_impl(
+    config: Config,
+    db_path: str,
+    info: BrokerInfo,
+) -> None:
     host = info.address
     port = info.port
     if not host.replace(".", "").replace(":", "").isdigit():
-        try:
-            resolved = await asyncio.get_event_loop().getaddrinfo(
-                host, port, type=socket.SOCK_DGRAM
-            )
-            if resolved:
-                host = resolved[0][4][0]
-        except Exception:
-            pass
-    country, city, continent, country_code, isp, org = await geolocate(host)
-    reverse_dns_name, hoster = await reverse_dns_and_whois(host)
-    has_api, version = await check_rest_api(host, config.rest_port_probe)
+        ip = await _resolve_host(host, port)
+        if ip:
+            host = ip
+    existing = await get_node_geo_dns(db_path, host)
+    if existing:
+        country, city, continent, country_code, isp, org, zip_val, lat, lon, reverse_dns_name, hoster = existing
+        has_geo = country is not None or city is not None or isp is not None
+        has_dns = reverse_dns_name is not None or hoster is not None
+    else:
+        has_geo, has_dns = False, False
+        country = city = continent = country_code = isp = org = zip_val = reverse_dns_name = hoster = None
+        lat = lon = None
+    if not has_geo:
+        country, city, continent, country_code, isp, org, zip_val, lat, lon = await geolocate(host)
+    if not has_dns:
+        reverse_dns_name, hoster = await reverse_dns_and_whois(host)
+    has_api, version = await check_rest_api(host, config.rest_port_probe, timeout=2.0)
+    client_id_raw: Optional[str] = None
     if version is None:
         try:
             version = await get_client_version_tcp(
-                host, config.broker_port, config.network_id, timeout=5.0
+                host, port, config.network_id, timeout=5.0
+            )
+            if version is not None:
+                client_id_raw = version
+        except Exception:
+            pass
+    if client_id_raw is None:
+        try:
+            client_id_raw = await get_client_version_tcp(
+                host, port, config.network_id, timeout=5.0
             )
         except Exception:
             pass
     synced: Optional[bool] = None
     if has_api:
         try:
-            synced = await check_synced(host, config.rest_port_probe, timeout=5.0)
+            self_clique = await fetch_self_clique(host, config.rest_port_probe, timeout=5.0)
+            if self_clique is not None:
+                synced, peer_addresses = self_clique
+                if peer_addresses:
+                    updated = await update_synced_for_clique_peers(db_path, peer_addresses, synced)
+                    if updated:
+                        logger.debug("Updated synced=%s for %s clique peer(s)", synced, updated)
+            inter_peers = await fetch_inter_clique_peer_info(host, config.rest_port_probe, timeout=5.0)
+            if inter_peers:
+                added = 0
+                for addr in inter_peers:
+                    ok, _ = await _try_port(addr, 9973, timeout=2.0)
+                    if ok:
+                        await ensure_node_in_db(db_path, addr, 9973)
+                        added += 1
+                    resp = await discover_from_node(config, addr, 9973, config.network_id)
+                    if resp:
+                        await ensure_node_in_db(db_path, addr, 9973)
+                        added += 1
+                        for info in resp:
+                            await ensure_node_in_db(db_path, info.address, info.port)
+                            asyncio.create_task(process_and_store_node(config, db_path, info))
+                if added > 0:
+                    logger.debug("Added inter-clique peer(s) from REST+FindNode for next iteration")
         except Exception:
             pass
+    chain_heights: Optional[List[int]] = None
+    if has_api:
+        try:
+            groups = 4 if config.network_id == 0 else 2
+            chain_heights = await fetch_chain_heights_rest(
+                host, config.rest_port_probe, groups=groups, timeout=3.0
+            )
+        except Exception:
+            pass
+    if chain_heights is None:
+        ref_list_p = config.reference_nodes or (
+            DEFAULT_MAINNET if config.network_id == 0 else DEFAULT_TESTNET
+        )
+        reference_nodes_p = [config.parse_node(s) for s in ref_list_p]
+        try:
+            cs = await get_chain_state_tcp(
+                host,
+                port,
+                config.network_id,
+                timeout=8.0,
+                broker_port=port,
+                reference_nodes=reference_nodes_p,
+                reference_broker_port=None,
+            )
+            if cs is not None:
+                chain_heights = [height for _, height in cs.tips]
+                if synced is None:
+                    synced = cs.synced
+                if client_id_raw is None and cs.client_id:
+                    client_id_raw = cs.client_id
+        except Exception:
+            pass
+    client_parsed = parse_client_id(client_id_raw) if client_id_raw else None
+    version_str = version
+    client_str: Optional[str] = None
+    os_str: Optional[str] = None
+    if client_parsed:
+        if client_parsed.version is not None:
+            version_str = client_parsed.version
+        client_str = client_parsed.client
+        os_str = client_parsed.os
+    if synced is None and chain_heights:
+        max_heights = await get_max_network_heights(db_path)
+        if max_heights and _heights_within_threshold_of_max(chain_heights, max_heights):
+            synced = True
     clique_id_hex = info.clique_id.hex() if info.clique_id else None
     await upsert_node(
         db_path,
@@ -426,24 +700,121 @@ async def process_and_store_node(
         port,
         domain=info.address if info.address != host else None,
         clique_id=clique_id_hex,
-        version=version,
+        version=version_str,
         country=country,
         city=city,
         continent=continent,
         country_code=country_code,
         isp=isp,
         org=org,
+        zip=zip_val,
+        lat=lat,
+        lon=lon,
         has_api=has_api,
         synced=synced,
         status="offline",
         reverse_dns=reverse_dns_name,
         hoster=hoster,
+        chain_heights=chain_heights,
+        client=client_str,
+        os=os_str,
     )
-    logger.info("Node %s:%s version=%s country=%s has_api=%s synced=%s", _display_node(host, info.address if info.address != host else None), port, version, country, has_api, synced)
+    logger.info("Node %s:%s version=%s client=%s os=%s country=%s has_api=%s synced=%s", _display_node(host, info.address if info.address != host else None), port, version_str, client_str, os_str, country, has_api, synced)
 
 
 # Delay between each FindNode in a cycle (seconds) to avoid flooding
 FINDNODE_DELAY_SEC = 2.0
+# Max time per node in discovery loop (skip node if exceeded)
+PER_NODE_TIMEOUT_SEC = 120.0
+# DNS resolution timeout
+DNS_RESOLVE_TIMEOUT_SEC = 5.0
+# Limit concurrent enrich_node tasks to avoid HTTP/TCP thundering herd
+_ENRICH_SEMAPHORE = asyncio.Semaphore(5)
+
+
+async def _resolve_host(host: str, port: int) -> Optional[str]:
+    """Resolve hostname to IP via getaddrinfo with timeout. Returns IP or None on failure."""
+    try:
+        resolved = await asyncio.wait_for(
+            asyncio.get_event_loop().getaddrinfo(
+                host, port, type=socket.SOCK_DGRAM
+            ),
+            timeout=DNS_RESOLVE_TIMEOUT_SEC,
+        )
+        if resolved:
+            return resolved[0][4][0]
+    except (asyncio.TimeoutError, Exception):
+        pass
+    return None
+
+
+async def _process_one_node(
+    config: Config,
+    db_path: str,
+    proxy: Optional["UDPProxy"],
+    explore_host: str,
+    host: str,
+    port: int,
+    domain: Optional[str],
+    network_id: int,
+    display: str,
+    seen: Set[Tuple[str, int]],
+    to_ask: List[Tuple[str, int]],
+) -> None:
+    """Single-node discovery: Ping -> Pong, FindNode, probe ports, update status, enqueue enrich."""
+    timeout_udp = float(config.udp_timeout_seconds)
+    loop = asyncio.get_event_loop()
+    pong = await loop.run_in_executor(
+        None,
+        lambda: ping_reply_pong(explore_host, port, network_id, timeout_udp),
+    )
+    now = time.time()
+    discovery_status = PORT_STATUS_REACHABLE if pong else PORT_STATUS_CLOSED
+    await upsert_node_port(
+        db_path, explore_host, port, port, PORT_TYPE_DISCOVERY, discovery_status, now
+    )
+    await update_node_port_statuses(
+        db_path, explore_host, port, discovery_status=discovery_status
+    )
+    if pong:
+        logger.info("Ping -> Pong from %s:%s", display, port)
+    else:
+        logger.info("Ping -> no Pong from %s:%s (discovery closed)", display, port)
+
+    resp = None
+    if pong:
+        if proxy is not None:
+            resp = await _discover_node_via_proxy(
+                proxy, explore_host, port, network_id, timeout_udp
+            )
+        if resp is None:
+            resp = await _discover_node(
+                explore_host, port, network_id, timeout_udp
+            )
+
+    if resp:
+        if os.environ.get("SNIFFER_DEBUG"):
+            logger.debug("Raw reply %d bytes, magic(4)=%s", len(resp), resp[:4].hex() if len(resp) >= 4 else "?")
+        neighbors = extract_neighbors_from_message(resp, network_id)
+        if neighbors:
+            logger.info("FindNode reply from %s:%s: %d neighbors", display, port, len(neighbors))
+            for info in neighbors:
+                key = (info.address, info.port)
+                if key not in seen:
+                    seen.add(key)
+                    to_ask.append((info.address, info.port))
+                    await ensure_node_in_db(db_path, info.address, info.port, from_neighbors=True)
+                    asyncio.create_task(
+                        process_and_store_node(config, db_path, info)
+                    )
+
+    try:
+        await probe_node_ports(config, db_path, explore_host, port, timeout=4.0)
+    except Exception as e:
+        logger.debug("probe_node_ports %s:%s: %s", display, port, e)
+
+    await update_node_status_from_port_statuses(db_path, explore_host, port)
+    asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
 
 
 async def discovery_loop(config: Config, db_path: str, proxy: Optional["UDPProxy"] = None) -> None:
@@ -486,68 +857,42 @@ async def discovery_loop(config: Config, db_path: str, proxy: Optional["UDPProxy
             continue
 
         logger.info("Discovery cycle: asking %d nodes for neighbors", len(candidates))
-        for host, port, domain in candidates:
+        try:
+            from sniffer.bigquery import push_nodes_to_bigquery
+            asyncio.create_task(push_nodes_to_bigquery(config, db_path))
+        except ImportError:
+            pass
+        for idx, (host, port, domain) in enumerate(candidates):
+            if idx > 0 and idx % 50 == 0:
+                logger.info("Discovery progress: %d / %d nodes", idx, len(candidates))
             explore_host = host
             if not host.replace(".", "").replace(":", "").isdigit():
-                try:
-                    resolved = await asyncio.get_event_loop().getaddrinfo(
-                        host, port, type=socket.SOCK_DGRAM
-                    )
-                    if resolved:
-                        explore_host = resolved[0][4][0]
-                except Exception:
-                    pass
+                ip = await _resolve_host(host, port)
+                if ip:
+                    explore_host = ip
 
             display = _display_node(explore_host, domain)
             try:
-                logger.info("FindNode (discover neighbor) -> %s:%s", display, port)
-                resp = None
-                if proxy is not None:
-                    resp = await _discover_node_via_proxy(proxy, explore_host, port, network_id, float(config.udp_timeout_seconds))
-                if resp is None:
-                    resp = await _discover_node(
+                await asyncio.wait_for(
+                    _process_one_node(
+                        config,
+                        db_path,
+                        proxy,
                         explore_host,
+                        host,
                         port,
+                        domain,
                         network_id,
-                        float(config.udp_timeout_seconds),
-                    )
-                if not resp:
-                    logger.info("FindNode reply from %s:%s: (no response / timeout)", display, port)
-                    if os.environ.get("SNIFFER_DEBUG"):
-                        logger.debug("Sent Ping then FindNode; no reply (check magic bytes / firewall)")
-                    await mark_exploration_failed(db_path, explore_host, port)
-                    asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
-                else:
-                    if os.environ.get("SNIFFER_DEBUG"):
-                        logger.debug("Raw reply %d bytes, magic(4)=%s", len(resp), resp[:4].hex() if len(resp) >= 4 else "?")
-                    neighbors = extract_neighbors_from_message(resp, network_id)
-                    if neighbors:
-                        logger.info("FindNode reply from %s:%s: %d bytes -> %d neighbors: %s", display, port, len(resp), len(neighbors), [(n.address, n.port) for n in neighbors[:8]])
-                        await mark_exploration_success(db_path, explore_host, port)
-                        asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
-                        for info in neighbors:
-                            key = (info.address, info.port)
-                            if key not in seen:
-                                seen.add(key)
-                                to_ask.append((info.address, info.port))
-                                await ensure_node_in_db(db_path, info.address, info.port, from_neighbors=True)
-                                asyncio.create_task(
-                                    process_and_store_node(config, db_path, info)
-                                )
-                    else:
-                        payload_type, _ = get_response_payload_type(resp, network_id)
-                        if payload_type is not None:
-                            logger.info(
-                                "FindNode reply from %s:%s: %d bytes, payload_type=%s (expected 3=Neighbors)",
-                                display, port, len(resp), payload_type,
-                            )
-                        else:
-                            logger.info(
-                                "FindNode reply from %s:%s: %d bytes (unwrap/parse failed)",
-                                display, port, len(resp),
-                            )
-                        await mark_exploration_failed(db_path, explore_host, port)
-                        asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
+                        display,
+                        seen,
+                        to_ask,
+                    ),
+                    timeout=PER_NODE_TIMEOUT_SEC,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("Node %s:%s timed out after %s s, skipping", display, port, PER_NODE_TIMEOUT_SEC)
+                await mark_exploration_failed(db_path, explore_host, port)
+                asyncio.create_task(enrich_node(config, db_path, explore_host, port, display_name=display))
             except Exception as e:
                 logger.warning("Discovery from %s:%s failed: %s", display, port, e)
                 await mark_exploration_failed(db_path, explore_host, port)

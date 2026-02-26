@@ -14,8 +14,8 @@ logger = logging.getLogger(__name__)
 RATE_LIMIT_PER_MINUTE = 45
 RATE_WINDOW_SEC = 60.0
 
-# (country, city, continent, country_code, isp, org)
-GeoResult = Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]
+# (country, city, continent, country_code, isp, org, zip, lat, lon)
+GeoResult = Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[float], Optional[float]]
 
 _rate_timestamps: deque = deque()
 _rate_lock = threading.Lock()
@@ -42,21 +42,21 @@ async def _acquire_rate_slot() -> None:
 
 
 async def geolocate(ip: str) -> GeoResult:
-    """Return (country, city, continent, country_code, isp, org) for IP. Skip private/localhost."""
+    """Return (country, city, continent, country_code, isp, org, zip, lat, lon) for IP. Skip private/localhost."""
     if ip in ("127.0.0.1", "::1", "0.0.0.0") or ip.startswith("192.168.") or ip.startswith("10."):
-        return (None, None, None, None, None, None)
+        return (None, None, None, None, None, None, None, None, None)
     await _acquire_rate_slot()
     async with _sem:
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 r = await client.get(
-                    f"http://ip-api.com/json/{ip}?fields=country,city,continentCode,countryCode,isp,org"
+                    f"http://ip-api.com/json/{ip}?fields=country,city,continentCode,countryCode,isp,org,zip,lat,lon"
                 )
                 if r.status_code == 429:
                     logger.warning("ip-api rate limit (429); consider lowering discovery rate")
-                    return (None, None, None, None, None, None)
+                    return (None, None, None, None, None, None, None, None, None)
                 if r.status_code != 200:
-                    return (None, None, None, None, None, None)
+                    return (None, None, None, None, None, None, None, None, None)
                 data = r.json()
                 country = data.get("country")
                 city = data.get("city")
@@ -64,9 +64,22 @@ async def geolocate(ip: str) -> GeoResult:
                 country_code = data.get("countryCode")
                 isp = data.get("isp")
                 org = data.get("org")
-                return (country, city, continent, country_code, isp, org)
+                zip_val = data.get("zip")
+                if zip_val is not None and not isinstance(zip_val, str):
+                    zip_val = str(zip_val) if zip_val is not None else None
+                lat = data.get("lat")
+                if lat is not None and not isinstance(lat, (int, float)):
+                    lat = None
+                elif lat is not None:
+                    lat = float(lat)
+                lon = data.get("lon")
+                if lon is not None and not isinstance(lon, (int, float)):
+                    lon = None
+                elif lon is not None:
+                    lon = float(lon)
+                return (country, city, continent, country_code, isp, org, zip_val, lat, lon)
         except Exception as e:
             logger.debug("geolocate %s: %s", ip, e)
-            return (None, None, None, None, None, None)
+            return (None, None, None, None, None, None, None, None, None)
         finally:
             _release_rate_slot()

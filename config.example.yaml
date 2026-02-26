@@ -39,3 +39,10 @@ scan_interval_seconds: 300
 
 # Timeout for UDP discovery requests (seconds)
 udp_timeout_seconds: 25
+
+# Optional: push node snapshot to Google BigQuery after each discovery loop
+# Set project, dataset, and table to enable. Uses Application Default Credentials
+# (e.g. GOOGLE_APPLICATION_CREDENTIALS or gcloud auth application-default login).
+# bigquery_project: "my-gcp-project"
+# bigquery_dataset: "alephium"
+# bigquery_table: "nodes"

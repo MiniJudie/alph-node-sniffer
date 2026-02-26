@@ -17,7 +17,7 @@ Copy `config.example.yaml` to `config.yaml`. Key options:
 - **starting_nodes**: Bootstrap list to connect to first.
 - **reference_nodes**: Nodes used to relay incoming discovery requests; they are **also** added to the discovery list so they get explored for neighbors (merged with starting_nodes, no duplicate).
 - **network_id**: `0` = mainnet, `1` = testnet.
-- **broker_port**: TCP broker port (default 27665) used to fetch **client version** via the P2P Hello message when the REST API does not expose a version.
+- **broker_port**: TCP port for client version (Hello) when REST has no version. Omit or null = use each node's own port (from discovery); set to e.g. 27665 to use a fixed broker port.
 
 Reference nodes for mainnet (from Alephium config):
 
@@ -98,7 +98,19 @@ A full Alephium node uses **two separate channels**:
 
 2. **TCP broker (e.g. port 27665)** – Handled by `InterCliqueManager` / `InboundBrokerHandler`. Used for flow data (blocks, sync). The **first** message on TCP is **Hello** (with `clientId` like `scala-alephium/v4.3.0/Linux`). The node validates `ReleaseVersion` and `P2PVersion` from `clientId`; if the version is unknown or unsupported, it logs “Unknown client id” and **bans** that TCP peer (`InvalidClientVersion`). So the bans you see in node logs are for **TCP** connections with an invalid or old client version, not for UDP discovery.
 
-**This sniffer** uses **UDP discovery** (port 9973) for neighbors. It also opens a **TCP** connection to each node’s broker port (configurable `broker_port`, default 27665) when enriching: it connects, **reads** the first Hello message (server sends first on inbound), extracts `clientId` for the version field, then closes without sending anything—so it is **not** subject to InvalidClientVersion. Discovery itself does not require TCP; if discovery times out, the cause is typically **incoming UDP** being blocked (firewall/NAT).
+**This sniffer** uses **UDP discovery** (port 9973) for neighbors. It also opens a **TCP** connection to each node’s broker port (configurable `broker_port`; default: use the node’s own port) when enriching: it connects, **reads** the first Hello message (server sends first on inbound), extracts `clientId` for the version field, then closes without sending anything—so it is **not** subject to InvalidClientVersion. Discovery itself does not require TCP; if discovery times out, the cause is typically **incoming UDP** being blocked (firewall/NAT).
+
+### Data available through the broker (TCP) port
+
+The Alephium broker protocol (`alephium/protocol/.../message/Payload.scala`) defines what is sent over the TCP broker connection:
+
+| Source | Data |
+|--------|------|
+| **Hello** (first message from server) | **clientId** (string, e.g. `scala-alephium/v4.3.0/Linux` → version + OS), **timestamp**, **brokerInfo** (cliqueId, brokerId, brokerNum), **signature**. |
+| **ChainState** (after handshake) | **tips**: list of **ChainTip** = (blockHash, height, weight) per chain → sync state / heights. |
+| Other payloads | Ping/Pong, InvRequest/InvResponse, HeadersRequest/Response, BlocksRequest/Response, NewBlock, NewHeader, NewBlockHash, NewInv, NewTxHashes, TxsRequest/Response, HeadersByHeightsRequest/Response, BlocksAndUnclesByHeightsRequest/Response. |
+
+The sniffer currently only reads the first **Hello** and uses **clientId** (and optionally **brokerInfo**). Sync status and chain heights are taken from the node’s **REST API** (e.g. `/infos/self-clique-synced`, `/blockflow/chain-info`).
 
 ## Debug
 
@@ -146,9 +158,25 @@ python3 scripts/find_neighbors.py <host:port> [--network-id 0] [--timeout 10]
 
 Example: `python3 scripts/find_neighbors.py bootstrap0.alephium.org:9973`. If you get a timeout, incoming UDP to your host may be blocked (firewall/NAT).
 
+To **get a node's client version and OS** via TCP broker Hello:
+
+```bash
+python3 scripts/ask_node_version.py <host:port> [--broker-port 27665] [--network-id 0]
+```
+
+Example: `python3 scripts/ask_node_version.py bootstrap0.alephium.org:9973`
+
+To **show ChainState** (synced status and per-shard heights) via broker handshake:
+
+```bash
+python3 scripts/chain_state.py <host:port> [--broker-port 27665] [--network-id 0] [--json]
+```
+
+Example: `python3 scripts/chain_state.py 1.2.3.4:9973 --broker-port 27665`. Use `--json` for machine-readable output. Bootstrap nodes may not expose the broker; use a full node.
+
 ## API
 
-- `GET /nodes` – Paginated list of nodes. Response: `{ "stats": { "total", "online", "offline", "dead", "last_update" }, "nodes": [ ... ] }`.  
+- `GET /nodes` – Paginated list of nodes. Response: `{ "stats": { "total", "online", "offline", "unreachable", "last_update" }, "nodes": [ ... ] }`.  
   Each node includes: address, port, domain, version, country, city, continent, has_api, synced, status, **reverse_dns** (PTR hostname), **hoster** (WHOIS/RDAP org, e.g. ISP or cloud provider).  
   Query: `page` (default 1), `limit` (default 50, max 1000), and filters: `continent`, `country`, `has_api`, `version`, `status`, `synced` (true/false for synced or not).
 

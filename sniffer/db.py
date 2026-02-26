@@ -1,10 +1,11 @@
 """SQLite storage for discovered nodes."""
 import aiosqlite
+import json
 import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Optional
+from typing import Any, AsyncIterator, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +15,13 @@ STATUS_OFFLINE = "offline"
 STATUS_DEAD = "dead"
 OFFLINE_THRESHOLD_SEC = 60 * 60   # 30 minutes without response
 DEAD_THRESHOLD_SEC = 48 * 3600    # 48 hours without response
+
+# Port status (reachable / closed)
+PORT_STATUS_REACHABLE = "reachable"
+PORT_STATUS_CLOSED = "closed"
+PORT_TYPE_DISCOVERY = "discovery"
+PORT_TYPE_BROKER = "broker"
+PORT_TYPE_REST = "rest"
 
 
 async def init_db(db_path: str) -> None:
@@ -33,6 +41,9 @@ async def init_db(db_path: str) -> None:
                 country_code TEXT,
                 isp TEXT,
                 org TEXT,
+                zip TEXT,
+                lat REAL,
+                lon REAL,
                 has_api INTEGER NOT NULL DEFAULT 0,
                 synced INTEGER,
                 status TEXT NOT NULL DEFAULT 'offline',
@@ -41,10 +52,16 @@ async def init_db(db_path: str) -> None:
                 last_explored REAL,
                 reverse_dns TEXT,
                 hoster TEXT,
-                country_code TEXT,
-                isp TEXT,
-                org TEXT,
-                UNIQUE(address, port)
+                chain_heights TEXT,
+                client TEXT,
+                os TEXT,
+                broker_port INTEGER,
+                rest_port INTEGER,
+                discovery_status TEXT,
+                broker_status TEXT,
+                rest_status TEXT,
+                rest_url TEXT,
+                UNIQUE(address)
             )
         """)
         await db.commit()
@@ -69,6 +86,15 @@ async def init_db(db_path: str) -> None:
         if "synced" not in cols:
             await db.execute("ALTER TABLE nodes ADD COLUMN synced INTEGER")
             await db.commit()
+        if "chain_heights" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN chain_heights TEXT")
+            await db.commit()
+        if "client" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN client TEXT")
+            await db.commit()
+        if "os" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN os TEXT")
+            await db.commit()
 
         if "reverse_dns" not in cols:
             await db.execute("ALTER TABLE nodes ADD COLUMN reverse_dns TEXT")
@@ -86,6 +112,99 @@ async def init_db(db_path: str) -> None:
         if "org" not in cols:
             await db.execute("ALTER TABLE nodes ADD COLUMN org TEXT")
             await db.commit()
+        if "zip" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN zip TEXT")
+            await db.commit()
+        if "lat" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN lat REAL")
+            await db.commit()
+        if "lon" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN lon REAL")
+            await db.commit()
+
+        # Port discovery: per-port status (reachable/closed) for discovery, broker, rest
+        if "broker_port" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN broker_port INTEGER")
+            await db.commit()
+        if "rest_port" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN rest_port INTEGER")
+            await db.commit()
+        if "discovery_status" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN discovery_status TEXT")
+            await db.commit()
+        if "broker_status" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN broker_status TEXT")
+            await db.commit()
+        if "rest_status" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN rest_status TEXT")
+            await db.commit()
+        if "rest_url" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN rest_url TEXT")
+            await db.commit()
+
+        # Migration: one row per IP (address) instead of per (address, port)
+        async with db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
+        ) as cur:
+            has_nodes = await cur.fetchone() is not None
+        if has_nodes:
+            async with db.execute(
+                "SELECT address FROM nodes GROUP BY address HAVING COUNT(*) > 1 LIMIT 1"
+            ) as cur:
+                has_dups = await cur.fetchone() is not None
+            if has_dups:
+                await db.execute("""
+                    CREATE TABLE nodes_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        address TEXT NOT NULL UNIQUE,
+                        port INTEGER NOT NULL,
+                        domain TEXT,
+                        clique_id TEXT,
+                        version TEXT,
+                        country TEXT,
+                        city TEXT,
+                        continent TEXT,
+                        country_code TEXT,
+                        isp TEXT,
+                        org TEXT,
+                        zip TEXT,
+                        lat REAL,
+                        lon REAL,
+                        has_api INTEGER NOT NULL DEFAULT 0,
+                        synced INTEGER,
+                        status TEXT NOT NULL DEFAULT 'offline',
+                        first_seen REAL NOT NULL,
+                        last_seen REAL NOT NULL,
+                        last_explored REAL,
+                        reverse_dns TEXT,
+                        hoster TEXT,
+                        chain_heights TEXT,
+                        client TEXT,
+                        os TEXT,
+                        broker_port INTEGER,
+                        rest_port INTEGER,
+                        discovery_status TEXT,
+                        broker_status TEXT,
+                        rest_status TEXT,
+                        rest_url TEXT
+                    )
+                """)
+                await db.execute("""
+                    INSERT INTO nodes_new
+                    SELECT n.id, n.address, n.port, n.domain, n.clique_id, n.version, n.country, n.city,
+                           n.continent, n.country_code, n.isp, n.org, n.zip, n.lat, n.lon, n.has_api, n.synced,
+                           n.status, n.first_seen, n.last_seen, n.last_explored, n.reverse_dns, n.hoster,
+                           n.chain_heights, n.client, n.os, n.broker_port, n.rest_port, n.discovery_status,
+                           n.broker_status, n.rest_status, n.rest_url
+                    FROM nodes n
+                    WHERE NOT EXISTS (
+                        SELECT 1 FROM nodes n2
+                        WHERE n2.address = n.address AND n2.last_seen > n.last_seen
+                    )
+                """)
+                await db.execute("DROP TABLE nodes")
+                await db.execute("ALTER TABLE nodes_new RENAME TO nodes")
+                await db.commit()
 
         # Indexes (after migration so columns exist)
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_status ON nodes(status)")
@@ -94,6 +213,21 @@ async def init_db(db_path: str) -> None:
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_version ON nodes(version)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_has_api ON nodes(has_api)")
         await db.execute("CREATE INDEX IF NOT EXISTS idx_nodes_synced ON nodes(synced)")
+        await db.commit()
+
+        # Table: one row per (node address, node discovery port, probed port) with type and status
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS node_ports (
+                address TEXT NOT NULL,
+                node_port INTEGER NOT NULL,
+                port INTEGER NOT NULL,
+                port_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                last_checked REAL,
+                PRIMARY KEY (address, node_port, port)
+            )
+        """)
+        await db.execute("CREATE INDEX IF NOT EXISTS idx_node_ports_node ON node_ports(address, node_port)")
         await db.commit()
 
 
@@ -111,6 +245,9 @@ async def upsert_node(
     country_code: Optional[str] = None,
     isp: Optional[str] = None,
     org: Optional[str] = None,
+    zip: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
     has_api: bool = False,
     synced: Optional[bool] = None,
     status: Optional[str] = None,
@@ -120,8 +257,11 @@ async def upsert_node(
     reverse_dns: Optional[str] = None,
     hoster: Optional[str] = None,
     revive_dead: bool = False,
+    chain_heights: Optional[List[int]] = None,
+    client: Optional[str] = None,
+    os: Optional[str] = None,
 ) -> None:
-    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. clique_id is hex string (66 chars)."""
+    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. clique_id is hex string (66 chars). chain_heights: JSON array of 16 heights from broker ChainState. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
     now = time.time()
     st = status or STATUS_OFFLINE
     fse = first_seen if first_seen is not None else now
@@ -130,15 +270,16 @@ async def upsert_node(
     async with aiosqlite.connect(db_path) as db:
         if revive_dead:
             await db.execute(
-                "UPDATE nodes SET status = ? WHERE address = ? AND port = ? AND status = ?",
-                (STATUS_OFFLINE, address, port, STATUS_DEAD),
+                "UPDATE nodes SET status = ? WHERE address = ? AND status = ?",
+                (STATUS_OFFLINE, address, STATUS_DEAD),
             )
             await db.commit()
         await db.execute(
             """
-            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(address, port) DO UPDATE SET
+            INSERT INTO nodes (address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(address) DO UPDATE SET
+                port = excluded.port,
                 domain = COALESCE(excluded.domain, domain),
                 clique_id = COALESCE(excluded.clique_id, clique_id),
                 version = COALESCE(excluded.version, version),
@@ -155,7 +296,13 @@ async def upsert_node(
                 hoster = COALESCE(excluded.hoster, hoster),
                 country_code = COALESCE(excluded.country_code, country_code),
                 isp = COALESCE(excluded.isp, isp),
-                org = COALESCE(excluded.org, org)
+                org = COALESCE(excluded.org, org),
+                zip = COALESCE(excluded.zip, zip),
+                lat = COALESCE(excluded.lat, lat),
+                lon = COALESCE(excluded.lon, lon),
+                chain_heights = COALESCE(excluded.chain_heights, chain_heights),
+                client = COALESCE(excluded.client, client),
+                os = COALESCE(excluded.os, os)
             """,
             (
                 address,
@@ -177,6 +324,12 @@ async def upsert_node(
                 country_code,
                 isp,
                 org,
+                zip,
+                lat,
+                lon,
+                json.dumps(chain_heights) if chain_heights is not None else None,
+                client,
+                os,
             ),
         )
         await db.commit()
@@ -200,11 +353,20 @@ async def update_node_enrichment(
     country_code: Optional[str] = None,
     isp: Optional[str] = None,
     org: Optional[str] = None,
+    zip: Optional[str] = None,
+    lat: Optional[float] = None,
+    lon: Optional[float] = None,
+    chain_heights: Optional[List[int]] = None,
+    client: Optional[str] = None,
+    os: Optional[str] = None,
 ) -> None:
-    """Update only enrichment fields (version, geo, has_api, clique_id, synced, reverse_dns, hoster, country_code, isp, org); does not change status or timestamps."""
+    """Update only enrichment fields (version, geo, has_api, clique_id, synced, reverse_dns, hoster, country_code, isp, org, client, os, port); does not change status or timestamps."""
     async with aiosqlite.connect(db_path) as db:
         updates = []
         params: List[Any] = []
+        if port is not None:
+            updates.append("port = ?")
+            params.append(port)
         if domain is not None:
             updates.append("domain = ?")
             params.append(domain)
@@ -244,23 +406,65 @@ async def update_node_enrichment(
         if org is not None:
             updates.append("org = ?")
             params.append(org)
+        if zip is not None:
+            updates.append("zip = ?")
+            params.append(zip)
+        if lat is not None:
+            updates.append("lat = ?")
+            params.append(lat)
+        if lon is not None:
+            updates.append("lon = ?")
+            params.append(lon)
+        if chain_heights is not None:
+            updates.append("chain_heights = ?")
+            params.append(json.dumps(chain_heights))
+        if client is not None:
+            updates.append("client = ?")
+            params.append(client)
+        if os is not None:
+            updates.append("os = ?")
+            params.append(os)
         if not updates:
             return
-        params.extend([address, port])
+        params.append(address)
         await db.execute(
-            f"UPDATE nodes SET {', '.join(updates)} WHERE address = ? AND port = ?",
+            f"UPDATE nodes SET {', '.join(updates)} WHERE address = ?",
             params,
         )
         await db.commit()
 
 
+async def update_synced_for_clique_peers(
+    db_path: str,
+    peer_addresses: List[str],
+    synced: bool,
+) -> int:
+    """
+    Set synced for all nodes whose address or domain equals one of peer_addresses
+    (e.g. from /infos/self-clique nodes). Returns number of rows updated.
+    """
+    if not peer_addresses:
+        return 0
+    synced_int = 1 if synced else 0
+    total = 0
+    async with aiosqlite.connect(db_path) as db:
+        for peer in peer_addresses:
+            cursor = await db.execute(
+                "UPDATE nodes SET synced = ? WHERE address = ? OR domain = ?",
+                (synced_int, peer, peer),
+            )
+            total += cursor.rowcount
+        await db.commit()
+    return total
+
+
 async def mark_exploration_success(db_path: str, address: str, port: int) -> None:
-    """Called when we got a response from the node."""
+    """Called when we got a response from the node. Updates port to the one we probed."""
     now = time.time()
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
-            "UPDATE nodes SET status = ?, last_seen = ?, last_explored = ? WHERE address = ? AND port = ?",
-            (STATUS_ONLINE, now, now, address, port),
+            "UPDATE nodes SET status = ?, last_seen = ?, last_explored = ?, port = ? WHERE address = ?",
+            (STATUS_ONLINE, now, now, port, address),
         )
         await db.commit()
 
@@ -271,8 +475,8 @@ async def mark_exploration_failed(db_path: str, address: str, port: int) -> None
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT last_seen, status FROM nodes WHERE address = ? AND port = ?",
-            (address, port),
+            "SELECT last_seen, status FROM nodes WHERE address = ?",
+            (address,),
         ) as cur:
             row = await cur.fetchone()
         if not row:
@@ -286,10 +490,139 @@ async def mark_exploration_failed(db_path: str, address: str, port: int) -> None
         else:
             new_status = row["status"]
         await db.execute(
-            "UPDATE nodes SET status = ?, last_explored = ? WHERE address = ? AND port = ?",
-            (new_status, now, address, port),
+            "UPDATE nodes SET status = ?, last_explored = ?, port = ? WHERE address = ?",
+            (new_status, now, port, address),
         )
         await db.commit()
+
+
+async def upsert_node_port(
+    db_path: str,
+    address: str,
+    node_port: int,
+    port: int,
+    port_type: str,
+    status: str,
+    last_checked: Optional[float] = None,
+) -> None:
+    """Insert or replace one row in node_ports. status: reachable | closed."""
+    now = time.time()
+    ts = last_checked if last_checked is not None else now
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            """
+            INSERT INTO node_ports (address, node_port, port, port_type, status, last_checked)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(address, node_port, port) DO UPDATE SET
+                port_type = excluded.port_type,
+                status = excluded.status,
+                last_checked = excluded.last_checked
+            """,
+            (address, node_port, port, port_type, status, ts),
+        )
+        await db.commit()
+
+
+async def update_node_port_statuses(
+    db_path: str,
+    address: str,
+    port: int,
+    *,
+    discovery_status: Optional[str] = None,
+    broker_port: Optional[int] = None,
+    broker_status: Optional[str] = None,
+    rest_port: Optional[int] = None,
+    rest_status: Optional[str] = None,
+    rest_url: Optional[str] = None,
+) -> None:
+    """Update nodes table port columns. When broker_port is set, also set nodes.port = broker_port (main port in DB is broker port)."""
+    updates = []
+    params: List[Any] = []
+    if discovery_status is not None:
+        updates.append("discovery_status = ?")
+        params.append(discovery_status)
+    if broker_port is not None:
+        updates.append("broker_port = ?")
+        params.append(broker_port)
+        updates.append("port = ?")
+        params.append(broker_port)
+    if broker_status is not None:
+        updates.append("broker_status = ?")
+        params.append(broker_status)
+    if rest_port is not None:
+        updates.append("rest_port = ?")
+        params.append(rest_port)
+    if rest_status is not None:
+        updates.append("rest_status = ?")
+        params.append(rest_status)
+    if rest_url is not None:
+        updates.append("rest_url = ?")
+        params.append(rest_url)
+    if not updates:
+        return
+    params.append(address)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            f"UPDATE nodes SET {', '.join(updates)} WHERE address = ?",
+            params,
+        )
+        await db.commit()
+
+
+async def update_node_status_from_port_statuses(db_path: str, address: str, port: int) -> None:
+    """
+    Set node status from discovery/broker/rest port statuses: online if any is reachable,
+    else offline/dead (based on last_seen age). Updates last_seen when any port is reachable,
+    and last_explored always.
+    """
+    now = time.time()
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT discovery_status, broker_status, rest_status, last_seen, status FROM nodes WHERE address = ?",
+            (address,),
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return
+        d = (row["discovery_status"] or "").strip().lower() == "reachable"
+        b = (row["broker_status"] or "").strip().lower() == "reachable"
+        r = (row["rest_status"] or "").strip().lower() == "reachable"
+        any_reachable = d or b or r
+        if any_reachable:
+            await db.execute(
+                "UPDATE nodes SET status = ?, last_seen = ?, last_explored = ?, port = ? WHERE address = ?",
+                (STATUS_ONLINE, now, now, port, address),
+            )
+        else:
+            last_seen = row["last_seen"] or 0
+            age = now - last_seen
+            if age >= DEAD_THRESHOLD_SEC:
+                new_status = STATUS_DEAD
+            elif age >= OFFLINE_THRESHOLD_SEC:
+                new_status = STATUS_OFFLINE
+            else:
+                new_status = row["status"] or STATUS_OFFLINE
+            await db.execute(
+                "UPDATE nodes SET status = ?, last_explored = ?, port = ? WHERE address = ?",
+                (new_status, now, port, address),
+            )
+        await db.commit()
+
+
+async def get_node_ports(db_path: str, address: str, node_port: int) -> List[dict]:
+    """Return list of { port, port_type, status, last_checked } for the given node."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT port, port_type, status, last_checked FROM node_ports WHERE address = ? AND node_port = ? ORDER BY port_type, port",
+            (address, node_port),
+        ) as cur:
+            rows = await cur.fetchall()
+    return [
+        {"port": r["port"], "port_type": r["port_type"], "status": r["status"], "last_checked": r["last_checked"]}
+        for r in rows
+    ]
 
 
 async def get_nodes_to_explore(db_path: str, limit: int = 1) -> List[tuple]:
@@ -328,11 +661,116 @@ async def revive_if_dead(db_path: str, address: str, port: int) -> bool:
     """If node is dead, set status=offline so it gets explored again. Returns True if was dead and revived."""
     async with aiosqlite.connect(db_path) as db:
         cur = await db.execute(
-            "UPDATE nodes SET status = ? WHERE address = ? AND port = ? AND status = ?",
-            (STATUS_OFFLINE, address, port, STATUS_DEAD),
+            "UPDATE nodes SET status = ?, port = ? WHERE address = ? AND status = ?",
+            (STATUS_OFFLINE, port, address, STATUS_DEAD),
         )
         await db.commit()
         return cur.rowcount > 0
+
+
+# Threshold (in blocks) below network max at which a node is still considered synced
+SYNCED_HEIGHT_THRESHOLD = 50
+
+
+async def get_max_network_heights(db_path: str) -> Optional[List[int]]:
+    """
+    Compute max chain height per shard across all nodes with chain_heights.
+    Returns list of max heights [max_shard_0, max_shard_1, ...] or None if no nodes have chain_heights.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT chain_heights FROM nodes WHERE chain_heights IS NOT NULL AND chain_heights != ''"
+        ) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        return None
+    max_heights: List[int] = []
+    for row in rows:
+        raw = row[0]
+        if not raw:
+            continue
+        try:
+            heights = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(heights, list):
+            continue
+        for i, h in enumerate(heights):
+            if not isinstance(h, (int, float)):
+                continue
+            h_int = int(h)
+            while len(max_heights) <= i:
+                max_heights.append(0)
+            if h_int > max_heights[i]:
+                max_heights[i] = h_int
+    return max_heights if max_heights else None
+
+
+def _heights_within_threshold_of_max(
+    chain_heights: List[int],
+    max_heights: List[int],
+    threshold: int = SYNCED_HEIGHT_THRESHOLD,
+) -> bool:
+    """Return True if each node height is within threshold blocks of the network max for that shard."""
+    if not chain_heights or not max_heights:
+        return False
+    for i, h in enumerate(chain_heights):
+        if i >= len(max_heights):
+            break
+        if h < max_heights[i] - threshold:
+            return False
+    return True
+
+
+async def get_node_chain_state(db_path: str, address: str, port: int) -> Optional[dict]:
+    """Return chainstate fields for one node (address, port, synced, chain_heights, version, etc.) or None if not found."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT address, port, domain, version, synced, chain_heights, client, os FROM nodes WHERE address = ?",
+            (address,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {
+        "address": row["address"],
+        "port": row["port"],
+        "domain": row["domain"],
+        "version": row["version"],
+        "synced": None if row["synced"] is None else bool(row["synced"]),
+        "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+        "client": row["client"],
+        "os": row["os"],
+    }
+
+
+async def get_node_geo_dns(
+    db_path: str, address: str
+) -> Optional[Tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[float], Optional[float], Optional[str], Optional[str]]]:
+    """Get geo and DNS fields for node. Returns (country, city, continent, country_code, isp, org, zip, lat, lon, reverse_dns, hoster) or None if not found."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT country, city, continent, country_code, isp, org, zip, lat, lon, reverse_dns, hoster FROM nodes WHERE address = ?",
+            (address,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return (
+        row["country"],
+        row["city"],
+        row["continent"],
+        row["country_code"],
+        row["isp"],
+        row["org"],
+        row["zip"],
+        row["lat"],
+        row["lon"],
+        row["reverse_dns"],
+        row["hoster"],
+    )
 
 
 async def get_stats(db_path: str) -> dict[str, Any]:
@@ -369,6 +807,52 @@ async def get_stats(db_path: str) -> dict[str, Any]:
         }
 
 
+async def get_node_by_address(db_path: str, address: str) -> Optional[dict[str, Any]]:
+    """Return full node info by address (IP) or None if not found."""
+    async with aiosqlite.connect(db_path) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url FROM nodes WHERE address = ?",
+            (address,),
+        ) as cur:
+            row = await cur.fetchone()
+    if not row:
+        return None
+    return {
+        "address": row["address"],
+        "port": row["port"],
+        "domain": row["domain"],
+        "clique_id": row["clique_id"],
+        "version": row["version"],
+        "country": row["country"],
+        "city": row["city"],
+        "continent": row["continent"],
+        "has_api": bool(row["has_api"]),
+        "synced": None if row["synced"] is None else bool(row["synced"]),
+        "status": row["status"],
+        "date_first_seen": row["first_seen"],
+        "date_last_seen": row["last_seen"],
+        "date_last_explored": row["last_explored"],
+        "reverse_dns": row["reverse_dns"],
+        "hoster": row["hoster"],
+        "country_code": row["country_code"],
+        "isp": row["isp"],
+        "org": row["org"],
+        "zip": row["zip"],
+        "lat": row["lat"],
+        "lon": row["lon"],
+        "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+        "client": row["client"],
+        "os": row["os"],
+        "broker_port": row["broker_port"],
+        "rest_port": row["rest_port"],
+        "discovery_status": row["discovery_status"],
+        "broker_status": row["broker_status"],
+        "rest_status": row["rest_status"],
+        "rest_url": row["rest_url"],
+    }
+
+
 async def get_versions(db_path: str) -> List[dict[str, Any]]:
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
@@ -393,7 +877,7 @@ async def get_nodes(
     status: Optional[str] = None,
     synced: Optional[bool] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org FROM nodes WHERE 1=1"
+    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url FROM nodes WHERE 1=1"
     params: List[Any] = []
     if continent is not None:
         query += " AND continent = ?"
@@ -438,6 +922,18 @@ async def get_nodes(
                     "country_code": row["country_code"],
                     "isp": row["isp"],
                     "org": row["org"],
+                    "zip": row["zip"],
+                    "lat": row["lat"],
+                    "lon": row["lon"],
+                    "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+                    "client": row["client"],
+                    "os": row["os"],
+                    "broker_port": row["broker_port"],
+                    "rest_port": row["rest_port"],
+                    "discovery_status": row["discovery_status"],
+                    "broker_status": row["broker_status"],
+                    "rest_status": row["rest_status"],
+                    "rest_url": row["rest_url"],
                 }
 
 
@@ -522,7 +1018,7 @@ async def get_nodes_paginated(
         offset = max(0, (page - 1) * limit)
         limit_val = max(1, min(limit, 1000))
         list_query = f"""
-            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org
+            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url
             FROM nodes WHERE {where}
             ORDER BY last_seen DESC
             LIMIT ? OFFSET ?
@@ -552,6 +1048,18 @@ async def get_nodes_paginated(
                 "country_code": row["country_code"],
                 "isp": row["isp"],
                 "org": row["org"],
+                "zip": row["zip"],
+                "lat": row["lat"],
+                "lon": row["lon"],
+                "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+                "client": row["client"],
+                "os": row["os"],
+                "broker_port": row["broker_port"],
+                "rest_port": row["rest_port"],
+                "discovery_status": row["discovery_status"],
+                "broker_status": row["broker_status"],
+                "rest_status": row["rest_status"],
+                "rest_url": row["rest_url"],
             })
     return {
         "stats": {

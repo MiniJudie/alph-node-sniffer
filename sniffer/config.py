@@ -20,6 +20,10 @@ class Config:
     broker_port: int = 27665
     scan_interval_seconds: int = 300
     udp_timeout_seconds: int = 5
+    # Optional: push nodes to BigQuery after each discovery loop (project, dataset, table)
+    bigquery_project: str = ""
+    bigquery_dataset: str = ""
+    bigquery_table: str = ""
 
     @classmethod
     def load(cls, path: str | Path | None = None) -> "Config":
@@ -46,6 +50,9 @@ class Config:
             broker_port=data.get("broker_port", 27665),
             scan_interval_seconds=data.get("scan_interval_seconds", 300),
             udp_timeout_seconds=data.get("udp_timeout_seconds", 5),
+            bigquery_project=data.get("bigquery_project", ""),
+            bigquery_dataset=data.get("bigquery_dataset", ""),
+            bigquery_table=data.get("bigquery_table", ""),
         )
 
     def parse_bind(self) -> tuple[str, int]:

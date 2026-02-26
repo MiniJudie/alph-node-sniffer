@@ -1,11 +1,15 @@
 """HTTP API with Swagger for node explorer."""
+import csv
+import io
+import json
 import logging
 from typing import Optional
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import Response
 
 from sniffer.config import Config
-from sniffer.db import get_nodes_paginated
+from sniffer.db import get_node_by_address, get_nodes, get_nodes_paginated
 
 logger = logging.getLogger(__name__)
 
@@ -17,7 +21,71 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         version="0.1.0",
     )
 
-    @app.get("/nodes")
+    @app.get(
+        "/nodes/csv",
+        tags=["Nodes"],
+        summary="Download nodes as CSV",
+        responses={
+            200: {
+                "content": {"text/csv": {"schema": {"type": "string", "format": "binary"}}},
+                "description": "CSV file with all nodes (filtered by query params)",
+            }
+        },
+    )
+    async def nodes_csv(
+        continent: Optional[str] = Query(None, description="Filter by continent code"),
+        country: Optional[str] = Query(None, description="Filter by country"),
+        has_api: Optional[bool] = Query(None, description="Filter by HTTP API exposed"),
+        version: Optional[str] = Query(None, description="Filter by node version"),
+        status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
+        synced: Optional[bool] = Query(None, description="Filter by sync: true=synced, false=not synced"),
+    ):
+        """Download all nodes (respecting filters) as CSV. Same query params as GET /nodes."""
+        fieldnames = [
+            "address", "port", "domain", "clique_id", "version", "country", "city", "continent",
+            "has_api", "synced", "status", "discovery_status", "broker_port", "broker_status", "rest_port", "rest_status", "rest_url",
+            "date_first_seen", "date_last_seen", "date_last_explored",
+            "reverse_dns", "hoster", "country_code", "isp", "org", "zip", "lat", "lon", "chain_heights", "client", "os",
+        ]
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        async for node in get_nodes(
+            db_path,
+            continent=continent,
+            country=country,
+            has_api=has_api,
+            version=version,
+            status=status,
+            synced=synced,
+        ):
+            row = dict(node)
+            if row.get("chain_heights") is not None:
+                row["chain_heights"] = json.dumps(row["chain_heights"]) if isinstance(row["chain_heights"], list) else str(row["chain_heights"])
+            for k in ("has_api", "synced"):
+                if row.get(k) is not None:
+                    row[k] = "true" if row[k] else "false"
+            writer.writerow(row)
+        return Response(
+            content=buf.getvalue().encode("utf-8"),
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": "attachment; filename=nodes.csv"},
+        )
+
+    @app.get(
+        "/nodes/{address}",
+        tags=["Nodes"],
+        summary="Get node by IP address",
+        responses={200: {"description": "Node info"}, 404: {"description": "Node not found"}},
+    )
+    async def node_by_address(address: str):
+        """Get node info by IP address. Returns 404 if not found."""
+        node = await get_node_by_address(db_path, address)
+        if node is None:
+            raise HTTPException(status_code=404, detail="Node not found")
+        return node
+
+    @app.get("/nodes", tags=["Nodes"])
     async def nodes(
         page: int = Query(1, ge=1, description="Page number (1-based)"),
         limit: int = Query(50, ge=1, le=1000, description="Items per page"),
