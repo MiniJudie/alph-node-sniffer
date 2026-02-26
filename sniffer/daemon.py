@@ -85,6 +85,10 @@ PHASE3_SEMAPHORE = 5   # UDP/TCP per node
 PHASE4_SEMAPHORE = 5   # FindNode / REST neighbors
 DELAY_BETWEEN_NODES_SEC = 0.3  # avoid burst on external APIs
 
+# Phase 1: cap time per node so one slow geo/whois/DNS cannot block the daemon
+PHASE1_GEOLOCATE_TIMEOUT_SEC = 12.0   # ip-api + rate limit wait
+PHASE1_REVERSE_DNS_WHOIS_TIMEOUT_SEC = 15.0  # whois/RDAP can hang on rate limit or slow servers
+
 # Broker ports to try when probing a node (9973 standard, 19140 common alternative)
 BROKER_PORTS_TO_TRY = [9973, 19140]
 
@@ -186,9 +190,21 @@ async def _phase1_geo_dns(
                 country = city = continent = country_code = isp = org = zip_val = reverse_dns_name = hoster = None
                 lat = lon = None
             if not has_geo:
-                country, city, continent, country_code, isp, org, zip_val, lat, lon = await geolocate(host)
+                try:
+                    country, city, continent, country_code, isp, org, zip_val, lat, lon = await asyncio.wait_for(
+                        geolocate(host), timeout=PHASE1_GEOLOCATE_TIMEOUT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("Phase 1 geolocate timeout for %s", display)
+                    country = city = continent = country_code = isp = org = zip_val = lat = lon = None
             if not has_dns:
-                reverse_dns_name, hoster = await reverse_dns_and_whois(host)
+                try:
+                    reverse_dns_name, hoster = await asyncio.wait_for(
+                        reverse_dns_and_whois(host), timeout=PHASE1_REVERSE_DNS_WHOIS_TIMEOUT_SEC
+                    )
+                except asyncio.TimeoutError:
+                    logger.debug("Phase 1 reverse_dns/whois timeout for %s", display)
+                    reverse_dns_name, hoster = None, None
             icmp_reachable = await _icmp_ping(host, timeout_sec=2.0)
             icmp_status = PORT_STATUS_REACHABLE if icmp_reachable else PORT_STATUS_CLOSED
             await update_node_port_statuses(db_path, address, port, icmp_status=icmp_status)

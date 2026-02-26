@@ -37,7 +37,11 @@ def _whois_hoster_sync(ip: str) -> Optional[str]:
         obj = IPWhois(ip)
         obj.timeout = WHOIS_TIMEOUT_SEC
         # depth=1 fetches entity details so we get org names from objects (e.g. "Google LLC")
-        res = obj.lookup_rdap(depth=1, get_asn_description=True)
+        res = obj.lookup_rdap(
+            depth=1,
+            get_asn_description=True,
+            rate_limit_timeout=5,
+        )
         if not res:
             return None
         # 1) Top-level ASN description (e.g. "GOOGLE, US")
