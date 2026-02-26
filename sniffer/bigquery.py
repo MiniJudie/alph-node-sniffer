@@ -18,16 +18,14 @@ def _row_for_bigquery(node: Dict[str, Any]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 row[key] = None
     if row.get("chain_heights") is not None:
-        if isinstance(row["chain_heights"], list):
-            row["chain_heights"] = json.dumps(row["chain_heights"])
-        else:
-            row["chain_heights"] = str(row["chain_heights"])
+        from sniffer.db import chain_heights_for_json
+        row["chain_heights"] = json.dumps(chain_heights_for_json(row["chain_heights"]) or {})
     # Ensure None instead of missing for optional fields so BQ schema is consistent
     for key in (
         "domain", "clique_id", "version", "country", "city", "continent",
         "reverse_dns", "hoster", "country_code", "isp", "org", "zip",
         "client", "os", "broker_port", "rest_port", "discovery_status",
-        "broker_status", "rest_status", "rest_url",
+        "broker_status", "rest_status", "rest_url", "cert_domains", "icmp_status", "misbehavior_count",
     ):
         if key not in row:
             row[key] = None

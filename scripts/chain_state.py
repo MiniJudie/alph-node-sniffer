@@ -25,7 +25,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
 
 from sniffer.version_check import get_chain_state_tcp
-from sniffer.db import get_node_chain_state
+from sniffer.db import chain_heights_for_json, get_node_chain_state
 
 
 def main() -> int:
@@ -84,6 +84,7 @@ def main() -> int:
                 print(f"Node {host}:{port} not found in database.", file=sys.stderr)
                 return 1
             if args.json:
+                ch_json = chain_heights_for_json(row["chain_heights"])
                 print(json.dumps({
                     "address": row["address"],
                     "port": row["port"],
@@ -92,7 +93,7 @@ def main() -> int:
                     "client": row["client"],
                     "os": row["os"],
                     "synced": row["synced"],
-                    "chain_heights": row["chain_heights"],
+                    "chain_heights": ch_json,
                 }, indent=2))
             else:
                 print(f"host: {row['address']}:{row['port']}")
@@ -104,15 +105,13 @@ def main() -> int:
                 if row.get("os"):
                     print(f"os: {row['os']}")
                 print(f"synced: {row['synced']}")
-                heights = row.get("chain_heights") or []
+                heights = row.get("chain_heights") or {}
                 print(f"chains: {len(heights)}")
                 if heights:
                     print("heights by chain (fromGroup, toGroup):")
-                    for i, height in enumerate(heights):
-                        from_g = i // 4
-                        to_g = i % 4
-                        print(f"  ({from_g},{to_g}): {height}")
-                    print(f"heights JSON: {json.dumps(heights)}")
+                    for (fg, tg), height in sorted(heights.items()):
+                        print(f"  ({fg},{tg}): {height}")
+                    print(f"heights JSON: {json.dumps(chain_heights_for_json(heights) or {})}")
             return 0
 
         # Live handshake
@@ -151,11 +150,14 @@ def main() -> int:
             return 1
         print("Got ChainState successfully.", file=sys.stderr)
         if args.json:
+            groups = 4 if len(cs.tips) >= 16 else 2
+            chain_heights = {f"{i // groups},{i % groups}": height for i, (_, height) in enumerate(cs.tips)}
             out = {
                 "client_id": cs.client_id,
                 "synced": cs.synced,
                 "tips": [{"hash": h.hex(), "height": height} for h, height in cs.tips],
                 "heights": [height for _, height in cs.tips],
+                "chain_heights": chain_heights,
             }
             print(json.dumps(out, indent=2))
         else:

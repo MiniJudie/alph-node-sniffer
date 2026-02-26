@@ -64,8 +64,8 @@ def main() -> None:
         "command",
         nargs="?",
         default="daemon",
-        choices=["daemon", "api", "ping"],
-        help="daemon (default): run proxy + discovery; api: HTTP API only; ping: send Ping to a node",
+        choices=["daemon", "linear-daemon", "api", "ping"],
+        help="daemon (default): 4-phase linear cycle; linear-daemon: same; api: HTTP API only; ping: send Ping to a node",
     )
     parser.add_argument(
         "-c", "--config",
@@ -98,6 +98,8 @@ def main() -> None:
     config = Config.load(args.config)
 
     if args.command == "daemon":
+        asyncio.run(run_daemon(config))
+    elif args.command == "linear-daemon":
         asyncio.run(run_daemon(config))
     elif args.command == "api":
         import uvicorn

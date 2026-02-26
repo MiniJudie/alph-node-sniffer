@@ -5,9 +5,64 @@ import logging
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, List, Optional, Tuple
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# chain_heights: stored as {(fromGroup, toGroup): height}. JSON uses keys "fromGroup,toGroup".
+ChainHeightsMap = Dict[Tuple[int, int], int]
+
+
+def _chain_heights_to_json(d: Optional[ChainHeightsMap]) -> Optional[str]:
+    """Serialize chain_heights dict to JSON string. Keys as 'fg,tg'."""
+    if not d:
+        return None
+    return json.dumps({f"{k[0]},{k[1]}": v for k, v in d.items()})
+
+
+def _chain_heights_from_json(s: Optional[str]) -> Optional[ChainHeightsMap]:
+    """Deserialize chain_heights from JSON. Supports both {'0,0': 123} and legacy [h0,h1,...]."""
+    if not s or not s.strip():
+        return None
+    try:
+        raw = json.loads(s)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if isinstance(raw, dict):
+        out: ChainHeightsMap = {}
+        for k, v in raw.items():
+            if not isinstance(k, str) or not isinstance(v, (int, float)):
+                continue
+            parts = k.split(",")
+            if len(parts) != 2:
+                continue
+            try:
+                fg, tg = int(parts[0].strip()), int(parts[1].strip())
+                out[(fg, tg)] = int(v)
+            except ValueError:
+                continue
+        return out if out else None
+    if isinstance(raw, list):
+        # Legacy: list of heights in order (0,0), (0,1), ..., (g-1,g-1)
+        groups = 4 if len(raw) >= 16 else 2
+        out = {}
+        for i, h in enumerate(raw):
+            if not isinstance(h, (int, float)):
+                continue
+            if i >= groups * groups:
+                break
+            fg, tg = i // groups, i % groups
+            out[(fg, tg)] = int(h)
+        return out if out else None
+    return None
+
+
+def chain_heights_for_json(m: Optional[ChainHeightsMap]) -> Optional[Dict[str, int]]:
+    """Convert chain_heights to a dict with string keys for JSON/API/BigQuery. Returns e.g. {'0,0': 123, '0,1': 456}."""
+    if not m:
+        return None
+    return {f"{k[0]},{k[1]}": v for k, v in m.items()}
+
 
 # Status: online, offline, dead (no response 30m -> offline, 48h -> dead)
 STATUS_ONLINE = "online"
@@ -61,6 +116,9 @@ async def init_db(db_path: str) -> None:
                 broker_status TEXT,
                 rest_status TEXT,
                 rest_url TEXT,
+                cert_domains TEXT,
+                icmp_status TEXT,
+                misbehavior_count INTEGER NOT NULL DEFAULT 0,
                 UNIQUE(address)
             )
         """)
@@ -142,6 +200,18 @@ async def init_db(db_path: str) -> None:
             await db.execute("ALTER TABLE nodes ADD COLUMN rest_url TEXT")
             await db.commit()
 
+        if "cert_domains" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN cert_domains TEXT")
+            await db.commit()
+
+        if "icmp_status" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN icmp_status TEXT")
+            await db.commit()
+
+        if "misbehavior_count" not in cols:
+            await db.execute("ALTER TABLE nodes ADD COLUMN misbehavior_count INTEGER NOT NULL DEFAULT 0")
+            await db.commit()
+
         # Migration: one row per IP (address) instead of per (address, port)
         async with db.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='nodes'"
@@ -186,7 +256,10 @@ async def init_db(db_path: str) -> None:
                         discovery_status TEXT,
                         broker_status TEXT,
                         rest_status TEXT,
-                        rest_url TEXT
+                        rest_url TEXT,
+                        cert_domains TEXT,
+                        icmp_status TEXT,
+                        misbehavior_count INTEGER NOT NULL DEFAULT 0
                     )
                 """)
                 await db.execute("""
@@ -195,7 +268,7 @@ async def init_db(db_path: str) -> None:
                            n.continent, n.country_code, n.isp, n.org, n.zip, n.lat, n.lon, n.has_api, n.synced,
                            n.status, n.first_seen, n.last_seen, n.last_explored, n.reverse_dns, n.hoster,
                            n.chain_heights, n.client, n.os, n.broker_port, n.rest_port, n.discovery_status,
-                           n.broker_status, n.rest_status, n.rest_url
+                           n.broker_status, n.rest_status, n.rest_url, n.cert_domains, n.icmp_status, n.misbehavior_count
                     FROM nodes n
                     WHERE NOT EXISTS (
                         SELECT 1 FROM nodes n2
@@ -257,12 +330,12 @@ async def upsert_node(
     reverse_dns: Optional[str] = None,
     hoster: Optional[str] = None,
     revive_dead: bool = False,
-    chain_heights: Optional[List[int]] = None,
+    chain_heights: Optional[ChainHeightsMap] = None,
     client: Optional[str] = None,
     os: Optional[str] = None,
     preserve_status: bool = False,
 ) -> None:
-    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. If preserve_status=True, on conflict do not overwrite status (used by enrichment to keep port-derived online/offline). clique_id is hex string (66 chars). chain_heights: JSON array of 16 heights from broker ChainState. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
+    """Insert or update node. If revive_dead=True and node exists as dead, set status to offline. If preserve_status=True, on conflict do not overwrite status (used by enrichment to keep port-derived online/offline). clique_id is hex string (66 chars). chain_heights: dict (fromGroup,toGroup) -> height from broker ChainState or REST. When updating on conflict, existing non-null values are never overwritten with null (COALESCE keeps existing)."""
     now = time.time()
     st = status or STATUS_OFFLINE
     fse = first_seen if first_seen is not None else now
@@ -328,7 +401,7 @@ async def upsert_node(
                 zip,
                 lat,
                 lon,
-                json.dumps(chain_heights) if chain_heights is not None else None,
+                _chain_heights_to_json(chain_heights),
                 client,
                 os,
                 1 if preserve_status else 0,
@@ -358,11 +431,12 @@ async def update_node_enrichment(
     zip: Optional[str] = None,
     lat: Optional[float] = None,
     lon: Optional[float] = None,
-    chain_heights: Optional[List[int]] = None,
+    chain_heights: Optional[ChainHeightsMap] = None,
     client: Optional[str] = None,
     os: Optional[str] = None,
+    cert_domains: Optional[List[str]] = None,
 ) -> None:
-    """Update only enrichment fields (version, geo, has_api, clique_id, synced, reverse_dns, hoster, country_code, isp, org, client, os, port); does not change status or timestamps."""
+    """Update only enrichment fields (version, geo, has_api, clique_id, synced, reverse_dns, hoster, country_code, isp, org, client, os, port, cert_domains); does not change status or timestamps."""
     async with aiosqlite.connect(db_path) as db:
         updates = []
         params: List[Any] = []
@@ -419,13 +493,16 @@ async def update_node_enrichment(
             params.append(lon)
         if chain_heights is not None:
             updates.append("chain_heights = ?")
-            params.append(json.dumps(chain_heights))
+            params.append(_chain_heights_to_json(chain_heights))
         if client is not None:
             updates.append("client = ?")
             params.append(client)
         if os is not None:
             updates.append("os = ?")
             params.append(os)
+        if cert_domains is not None:
+            updates.append("cert_domains = ?")
+            params.append(json.dumps(cert_domains) if cert_domains else None)
         if not updates:
             return
         params.append(address)
@@ -536,8 +613,9 @@ async def update_node_port_statuses(
     rest_port: Optional[int] = None,
     rest_status: Optional[str] = None,
     rest_url: Optional[str] = None,
+    icmp_status: Optional[str] = None,
 ) -> None:
-    """Update nodes table port columns. When broker_port is set, also set nodes.port = broker_port (main port in DB is broker port)."""
+    """Update nodes table port columns (and icmp_status). When broker_port is set, also set nodes.port = broker_port (main port in DB is broker port)."""
     updates = []
     params: List[Any] = []
     if discovery_status is not None:
@@ -560,6 +638,9 @@ async def update_node_port_statuses(
     if rest_url is not None:
         updates.append("rest_url = ?")
         params.append(rest_url)
+    if icmp_status is not None:
+        updates.append("icmp_status = ?")
+        params.append(icmp_status)
     if not updates:
         return
     params.append(address)
@@ -571,9 +652,22 @@ async def update_node_port_statuses(
         await db.commit()
 
 
+async def increment_misbehavior_count(db_path: str, address: str) -> int:
+    """Increment misbehavior_count for the node with this address (e.g. after seeing it in /infos/misbehaviors). Returns new count or 0 if not found."""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(
+            "UPDATE nodes SET misbehavior_count = COALESCE(misbehavior_count, 0) + 1 WHERE address = ?",
+            (address,),
+        )
+        await db.commit()
+        async with db.execute("SELECT misbehavior_count FROM nodes WHERE address = ?", (address,)) as cur:
+            row = await cur.fetchone()
+    return int(row[0]) if row else 0
+
+
 async def update_node_status_from_port_statuses(db_path: str, address: str, port: int) -> None:
     """
-    Set node status from discovery/broker/rest port statuses: online if any is reachable,
+    Set node status from discovery/broker/rest/icmp statuses: online if any is reachable,
     else offline/dead (based on last_seen age). Updates last_seen when any port is reachable,
     and last_explored always.
     """
@@ -581,7 +675,7 @@ async def update_node_status_from_port_statuses(db_path: str, address: str, port
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT discovery_status, broker_status, rest_status, last_seen, status FROM nodes WHERE address = ?",
+            "SELECT discovery_status, broker_status, rest_status, icmp_status, last_seen, status FROM nodes WHERE address = ?",
             (address,),
         ) as cur:
             row = await cur.fetchone()
@@ -590,7 +684,8 @@ async def update_node_status_from_port_statuses(db_path: str, address: str, port
         d = (row["discovery_status"] or "").strip().lower() == "reachable"
         b = (row["broker_status"] or "").strip().lower() == "reachable"
         r = (row["rest_status"] or "").strip().lower() == "reachable"
-        any_reachable = d or b or r
+        icmp = (row["icmp_status"] or "").strip().lower() == "reachable"
+        any_reachable = d or b or r or icmp
         if any_reachable:
             await db.execute(
                 "UPDATE nodes SET status = ?, last_seen = ?, last_explored = ?, port = ? WHERE address = ?",
@@ -674,10 +769,10 @@ async def revive_if_dead(db_path: str, address: str, port: int) -> bool:
 SYNCED_HEIGHT_THRESHOLD = 50
 
 
-async def get_max_network_heights(db_path: str) -> Optional[List[int]]:
+async def get_max_network_heights(db_path: str) -> Optional[ChainHeightsMap]:
     """
-    Compute max chain height per shard across all nodes with chain_heights.
-    Returns list of max heights [max_shard_0, max_shard_1, ...] or None if no nodes have chain_heights.
+    Compute max chain height per (fromGroup, toGroup) across all nodes with chain_heights.
+    Returns dict {(fromGroup, toGroup): max_height} or None if no nodes have chain_heights.
     """
     async with aiosqlite.connect(db_path) as db:
         async with db.execute(
@@ -686,40 +781,31 @@ async def get_max_network_heights(db_path: str) -> Optional[List[int]]:
             rows = await cur.fetchall()
     if not rows:
         return None
-    max_heights: List[int] = []
+    max_heights: ChainHeightsMap = {}
     for row in rows:
         raw = row[0]
-        if not raw:
+        heights = _chain_heights_from_json(raw)
+        if not heights:
             continue
-        try:
-            heights = json.loads(raw)
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(heights, list):
-            continue
-        for i, h in enumerate(heights):
-            if not isinstance(h, (int, float)):
-                continue
-            h_int = int(h)
-            while len(max_heights) <= i:
-                max_heights.append(0)
-            if h_int > max_heights[i]:
-                max_heights[i] = h_int
+        for k, h in heights.items():
+            if k not in max_heights or h > max_heights[k]:
+                max_heights[k] = h
     return max_heights if max_heights else None
 
 
 def _heights_within_threshold_of_max(
-    chain_heights: List[int],
-    max_heights: List[int],
+    chain_heights: ChainHeightsMap,
+    max_heights: ChainHeightsMap,
     threshold: int = SYNCED_HEIGHT_THRESHOLD,
 ) -> bool:
-    """Return True if each node height is within threshold blocks of the network max for that shard."""
+    """Return True if each node height (per chain key) is within threshold blocks of the network max."""
     if not chain_heights or not max_heights:
         return False
-    for i, h in enumerate(chain_heights):
-        if i >= len(max_heights):
-            break
-        if h < max_heights[i] - threshold:
+    for k, h in chain_heights.items():
+        max_h = max_heights.get(k)
+        if max_h is None:
+            continue
+        if h < max_h - threshold:
             return False
     return True
 
@@ -741,7 +827,7 @@ async def get_node_chain_state(db_path: str, address: str, port: int) -> Optiona
         "domain": row["domain"],
         "version": row["version"],
         "synced": None if row["synced"] is None else bool(row["synced"]),
-        "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+        "chain_heights": _chain_heights_from_json(row["chain_heights"]),
         "client": row["client"],
         "os": row["os"],
     }
@@ -814,7 +900,7 @@ async def get_node_by_address(db_path: str, address: str) -> Optional[dict[str, 
     async with aiosqlite.connect(db_path) as db:
         db.row_factory = aiosqlite.Row
         async with db.execute(
-            "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url FROM nodes WHERE address = ?",
+            "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url, cert_domains, icmp_status, misbehavior_count FROM nodes WHERE address = ?",
             (address,),
         ) as cur:
             row = await cur.fetchone()
@@ -843,7 +929,7 @@ async def get_node_by_address(db_path: str, address: str) -> Optional[dict[str, 
         "zip": row["zip"],
         "lat": row["lat"],
         "lon": row["lon"],
-        "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+        "chain_heights": _chain_heights_from_json(row["chain_heights"]),
         "client": row["client"],
         "os": row["os"],
         "broker_port": row["broker_port"],
@@ -852,6 +938,9 @@ async def get_node_by_address(db_path: str, address: str) -> Optional[dict[str, 
         "broker_status": row["broker_status"],
         "rest_status": row["rest_status"],
         "rest_url": row["rest_url"],
+        "cert_domains": json.loads(row["cert_domains"]) if row["cert_domains"] else None,
+        "icmp_status": row["icmp_status"],
+        "misbehavior_count": int(row["misbehavior_count"]) if row["misbehavior_count"] is not None else 0,
     }
 
 
@@ -879,7 +968,7 @@ async def get_nodes(
     status: Optional[str] = None,
     synced: Optional[bool] = None,
 ) -> AsyncIterator[dict[str, Any]]:
-    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url FROM nodes WHERE 1=1"
+    query = "SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url, cert_domains, icmp_status, misbehavior_count FROM nodes WHERE 1=1"
     params: List[Any] = []
     if continent is not None:
         query += " AND continent = ?"
@@ -927,7 +1016,7 @@ async def get_nodes(
                     "zip": row["zip"],
                     "lat": row["lat"],
                     "lon": row["lon"],
-                    "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+                    "chain_heights": _chain_heights_from_json(row["chain_heights"]),
                     "client": row["client"],
                     "os": row["os"],
                     "broker_port": row["broker_port"],
@@ -936,7 +1025,35 @@ async def get_nodes(
                     "broker_status": row["broker_status"],
                     "rest_status": row["rest_status"],
                     "rest_url": row["rest_url"],
+                    "cert_domains": json.loads(row["cert_domains"]) if row["cert_domains"] else None,
+                    "icmp_status": row["icmp_status"],
+                    "misbehavior_count": int(row["misbehavior_count"]) if row["misbehavior_count"] is not None else 0,
                 }
+
+
+async def get_all_nodes_list(
+    db_path: str,
+    *,
+    continent: Optional[str] = None,
+    country: Optional[str] = None,
+    has_api: Optional[bool] = None,
+    version: Optional[str] = None,
+    status: Optional[str] = None,
+    synced: Optional[bool] = None,
+) -> List[dict[str, Any]]:
+    """Return all nodes as a list (same dict shape as get_nodes). Used by linear-daemon to iterate in memory."""
+    out: List[dict[str, Any]] = []
+    async for node in get_nodes(
+        db_path,
+        continent=continent,
+        country=country,
+        has_api=has_api,
+        version=version,
+        status=status,
+        synced=synced,
+    ):
+        out.append(node)
+    return out
 
 
 def _nodes_where_clause(
@@ -1020,7 +1137,7 @@ async def get_nodes_paginated(
         offset = max(0, (page - 1) * limit)
         limit_val = max(1, min(limit, 1000))
         list_query = f"""
-            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url
+            SELECT address, port, domain, clique_id, version, country, city, continent, has_api, synced, status, first_seen, last_seen, last_explored, reverse_dns, hoster, country_code, isp, org, zip, lat, lon, chain_heights, client, os, broker_port, rest_port, discovery_status, broker_status, rest_status, rest_url, cert_domains, icmp_status, misbehavior_count
             FROM nodes WHERE {where}
             ORDER BY last_seen DESC
             LIMIT ? OFFSET ?
@@ -1053,7 +1170,7 @@ async def get_nodes_paginated(
                 "zip": row["zip"],
                 "lat": row["lat"],
                 "lon": row["lon"],
-                "chain_heights": json.loads(row["chain_heights"]) if row["chain_heights"] else None,
+                "chain_heights": _chain_heights_from_json(row["chain_heights"]),
                 "client": row["client"],
                 "os": row["os"],
                 "broker_port": row["broker_port"],
@@ -1062,6 +1179,9 @@ async def get_nodes_paginated(
                 "broker_status": row["broker_status"],
                 "rest_status": row["rest_status"],
                 "rest_url": row["rest_url"],
+                "cert_domains": json.loads(row["cert_domains"]) if row["cert_domains"] else None,
+                "icmp_status": row["icmp_status"],
+                "misbehavior_count": int(row["misbehavior_count"]) if row["misbehavior_count"] is not None else 0,
             })
     return {
         "stats": {

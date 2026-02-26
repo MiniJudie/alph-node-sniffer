@@ -9,7 +9,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import Response
 
 from sniffer.config import Config
-from sniffer.db import get_node_by_address, get_nodes, get_nodes_paginated
+from sniffer.db import chain_heights_for_json, get_node_by_address, get_nodes, get_nodes_paginated
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +61,7 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         ):
             row = dict(node)
             if row.get("chain_heights") is not None:
-                row["chain_heights"] = json.dumps(row["chain_heights"]) if isinstance(row["chain_heights"], list) else str(row["chain_heights"])
+                row["chain_heights"] = json.dumps(chain_heights_for_json(row["chain_heights"]) or {})
             for k in ("has_api", "synced"):
                 if row.get(k) is not None:
                     row[k] = "true" if row[k] else "false"
@@ -83,6 +83,8 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         node = await get_node_by_address(db_path, address)
         if node is None:
             raise HTTPException(status_code=404, detail="Node not found")
+        if node.get("chain_heights") is not None:
+            node["chain_heights"] = chain_heights_for_json(node["chain_heights"])
         return node
 
     @app.get("/nodes", tags=["Nodes"])
@@ -97,7 +99,7 @@ def create_app(config: Config, db_path: str) -> FastAPI:
         synced: Optional[bool] = Query(None, description="Filter by sync: true=synced, false=not synced"),
     ):
         """Paginated list of nodes. Response: { stats: { total, online, offline, dead, last_update }, nodes: [] }. Filters: continent, country, has_api, version, status, synced."""
-        return await get_nodes_paginated(
+        result = await get_nodes_paginated(
             db_path,
             page=page,
             limit=limit,
@@ -108,5 +110,25 @@ def create_app(config: Config, db_path: str) -> FastAPI:
             status=status,
             synced=synced,
         )
+        for n in result.get("nodes", []):
+            if n.get("chain_heights") is not None:
+                n["chain_heights"] = chain_heights_for_json(n["chain_heights"])
+        return result
+
+    @app.get(
+        "/status/node",
+        tags=["Status"],
+        summary="List all nodes as host:port -> status",
+        description="Returns a map of '<address>:<port>' to status (online, offline, dead). Optional status filter.",
+    )
+    async def status_node(
+        status: Optional[str] = Query(None, description="Filter by status: online, offline, dead"),
+    ):
+        """Returns { '<host>:<port>': '<status>', ... }. Use status query to filter (e.g. ?status=online)."""
+        out = {}
+        async for node in get_nodes(db_path, status=status):
+            key = f"{node['address']}:{node['port']}"
+            out[key] = node["status"]
+        return out
 
     return app

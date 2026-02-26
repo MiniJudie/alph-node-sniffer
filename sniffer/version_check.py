@@ -1,14 +1,59 @@
 """Check if node exposes Alephium REST API and get version; fallback to TCP broker Hello for clientId."""
 import asyncio
 import logging
+import ssl
+import socket
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urlparse
 
 import httpx
 
 from sniffer.protocol import fetch_client_version_tcp, fetch_chain_state_tcp
 
 logger = logging.getLogger(__name__)
+
+# Ports to try for REST (linear daemon: after 301, retry redirect host on these)
+REST_PROBE_PORTS = [12973, 80, 443]
+
+
+def _get_ssl_cert_domains_sync(host: str, port: int, timeout: float = 5.0) -> List[str]:
+    """Sync: connect to host:port with TLS, return list of DNS names from cert (SAN + CN)."""
+    domains: List[str] = []
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                cert = ssock.getpeercert()
+                if not cert:
+                    return []
+                san = cert.get("subjectAltName") or []
+                for name_type, name_value in san:
+                    if name_type == "DNS" and isinstance(name_value, str) and name_value.strip():
+                        v = name_value.strip()
+                        if v not in domains:
+                            domains.append(v)
+                subject = cert.get("subject") or []
+                for attr in subject:
+                    if isinstance(attr, (list, tuple)) and len(attr) >= 1:
+                        name, value = attr[0] if isinstance(attr[0], (list, tuple)) else (None, None)
+                        if name == "commonName" and isinstance(value, str) and value.strip() and value not in domains:
+                            domains.append(value.strip())
+                            break
+    except Exception as e:
+        logger.debug("get_ssl_cert_domains %s:%s %s", host, port, e)
+    return domains
+
+
+async def get_ssl_cert_domains(host: str, port: int, timeout: float = 5.0) -> List[str]:
+    """Async: get TLS cert DNS names for host:port (run sync helper in executor)."""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(
+        None,
+        lambda: _get_ssl_cert_domains_sync(host, port, timeout),
+    )
 
 
 @dataclass
@@ -80,6 +125,136 @@ async def _try_port(host: str, port: int, timeout: float) -> Tuple[bool, Optiona
     except Exception as e:
         logger.debug("check_rest %s:%s %s", host, port, e)
         return (False, None)
+
+
+def _parse_redirect_location(location: Optional[str]) -> Optional[Tuple[str, int]]:
+    """Parse Location header URL; return (host, port) or None."""
+    if not location or not location.strip():
+        return None
+    try:
+        parsed = urlparse(location.strip())
+        host = (parsed.hostname or "").strip()
+        if not host:
+            return None
+        port = parsed.port
+        if port is None:
+            port = 443 if parsed.scheme == "https" else 80
+        return (host, port)
+    except Exception:
+        return None
+
+
+def _is_alephium_version_response(response: "httpx.Response") -> bool:
+    """
+    Return True only if the response looks like Alephium REST /infos/version:
+    status 200, JSON body, and has releaseVersion or version (string or nested).
+    Rejects HTML or other non-API responses.
+    """
+    if response.status_code != 200:
+        return False
+    ct = (response.headers.get("content-type") or "").lower().split(";")[0].strip()
+    if ct == "text/html" or ct.startswith("text/"):
+        return False
+    try:
+        data = response.json()
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    ver = data.get("releaseVersion") or data.get("version")
+    if isinstance(ver, dict):
+        ver = ver.get("releaseVersion") or ver.get("version")
+    return isinstance(ver, str) and bool(ver.strip())
+
+
+async def try_rest_with_301_and_cert(
+    host: str,
+    rest_port_probe: int,
+    timeout: float = 3.0,
+) -> Tuple[bool, Optional[str], Optional[str], List[str]]:
+    """
+    Try REST /infos/version on host with ports rest_port_probe, 80, 443 (http and https).
+    On 301/302: extract Location host and retry with that host on 12973, 80, 443 (http and https).
+    On 200 over HTTPS: fetch TLS cert and extract certificate domains (SAN + CN).
+    Returns (has_api, version, rest_url, cert_domains).
+    """
+    cert_domains: List[str] = []
+    ports_to_try = [rest_port_probe, 80, 443]
+    if 80 not in ports_to_try:
+        ports_to_try.append(80)
+    if 443 not in ports_to_try:
+        ports_to_try.append(443)
+
+    async def do_one(h: str, port: int, use_https: bool) -> Tuple[Optional[int], Optional[str], Optional[Tuple[str, int]]]:
+        scheme = "https" if use_https else "http"
+        if port in (80, 443):
+            url = f"{scheme}://{h}/infos/version"
+        else:
+            url = f"{scheme}://{h}:{port}/infos/version"
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
+                r = await client.get(url)
+                if _is_alephium_version_response(r):
+                    version = None
+                    try:
+                        data = r.json()
+                        ver = data.get("releaseVersion") or data.get("version")
+                        if isinstance(ver, dict):
+                            ver = ver.get("releaseVersion") or ver.get("version")
+                        if isinstance(ver, str) and ver.strip():
+                            version = ver.strip()
+                    except Exception:
+                        pass
+                    return (200, version, None)
+                if r.status_code in (301, 302):
+                    loc = r.headers.get("Location")
+                    redir = _parse_redirect_location(loc)
+                    return (r.status_code, None, redir)
+                return (r.status_code, None, None)
+        except Exception as e:
+            logger.debug("try_rest %s %s:%s %s", scheme, h, port, e)
+            return (None, None, None)
+
+    redirect_hosts: List[Tuple[str, int]] = []
+    seen_redirect_hosts: Set[str] = set()
+
+    for port in ports_to_try:
+        for use_https in ([True] if port == 443 else [False] if port == 80 else [False, True]):
+            status, version, redir = await do_one(host, port, use_https)
+            if status == 200:
+                if port == 443:
+                    rest_url = f"https://{host}/infos/node"
+                    cert_domains = await get_ssl_cert_domains(host, port, timeout)
+                elif port == 80:
+                    rest_url = f"http://{host}/infos/node"
+                else:
+                    rest_url = f"http://{host}:{port}/infos/node"
+                    if use_https:
+                        rest_url = f"https://{host}:{port}/infos/node"
+                        cert_domains = await get_ssl_cert_domains(host, port, timeout)
+                return (True, version, rest_url, cert_domains)
+            if redir and redir[0] not in seen_redirect_hosts:
+                seen_redirect_hosts.add(redir[0])
+                redirect_hosts.append(redir)
+
+    for redir_host, _ in redirect_hosts:
+        for port in REST_PROBE_PORTS:
+            for use_https in ([True] if port == 443 else [False] if port == 80 else [False, True]):
+                status, version, _ = await do_one(redir_host, port, use_https)
+                if status == 200:
+                    if port == 443:
+                        rest_url = f"https://{redir_host}/infos/node"
+                        cert_domains = await get_ssl_cert_domains(redir_host, port, timeout)
+                    elif port == 80:
+                        rest_url = f"http://{redir_host}/infos/node"
+                    else:
+                        rest_url = f"http://{redir_host}:{port}/infos/node"
+                        if use_https:
+                            rest_url = f"https://{redir_host}:{port}/infos/node"
+                            cert_domains = await get_ssl_cert_domains(redir_host, port, timeout)
+                    return (True, version, rest_url, cert_domains)
+
+    return (False, None, None, [])
 
 
 async def check_rest_api(
@@ -158,22 +333,22 @@ async def fetch_chain_heights_rest(
     port: int,
     groups: int = 4,
     timeout: float = 3.0,
-) -> Optional[List[int]]:
+) -> Optional[Dict[Tuple[int, int], int]]:
     """
     GET /blockflow/chain-info for all chain indices (fromGroup, toGroup).
-    Returns list of currentHeight for each shard in order (0,0), (0,1), ..., (groups-1, groups-1), or None on failure.
+    Returns dict {(fromGroup, toGroup): currentHeight} or None on failure.
     """
     ports_to_try = [port]
     if 80 not in ports_to_try:
         ports_to_try.append(80)
     if 443 not in ports_to_try:
         ports_to_try.append(443)
-    heights: List[int] = []
     for p in ports_to_try:
         scheme = "https" if p == 443 else "http"
         base = f"{scheme}://{host}" if p in (80, 443) else f"{scheme}://{host}:{p}"
         try:
             async with httpx.AsyncClient(timeout=timeout) as client:
+                result: Dict[Tuple[int, int], int] = {}
                 for from_group in range(groups):
                     for to_group in range(groups):
                         r = await client.get(
@@ -185,8 +360,8 @@ async def fetch_chain_heights_rest(
                         h = data.get("currentHeight")
                         if not isinstance(h, (int, float)):
                             return None
-                        heights.append(int(h))
-                return heights
+                        result[(from_group, to_group)] = int(h)
+                return result
         except Exception as e:
             logger.debug("fetch_chain_heights_rest %s:%s %s", host, p, e)
     return None
@@ -364,4 +539,42 @@ async def fetch_discovered_neighbors(
                 return neighbors
         except Exception as e:
             logger.debug("fetch_discovered_neighbors %s:%s %s", host, p, e)
+    return None
+
+
+async def fetch_misbehaviors(
+    host: str,
+    port: int,
+    timeout: float = 3.0,
+) -> Optional[List[str]]:
+    """
+    GET /infos/misbehaviors on node. Tries port, then 80, then 443.
+    Returns list of peer addresses (IP/host strings) from the misbehaviors list, or None on failure.
+    """
+    ports_to_try = [port]
+    if 80 not in ports_to_try:
+        ports_to_try.append(80)
+    if 443 not in ports_to_try:
+        ports_to_try.append(443)
+    for p in ports_to_try:
+        scheme = "https" if p == 443 else "http"
+        base = f"{scheme}://{host}" if p in (80, 443) else f"{scheme}://{host}:{p}"
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                r = await client.get(f"{base}/infos/misbehaviors")
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+                if not isinstance(data, list):
+                    continue
+                peers: List[str] = []
+                for item in data:
+                    if not isinstance(item, dict):
+                        continue
+                    peer = item.get("peer")
+                    if isinstance(peer, str) and peer.strip():
+                        peers.append(peer.strip())
+                return peers
+        except Exception as e:
+            logger.debug("fetch_misbehaviors %s:%s %s", host, p, e)
     return None

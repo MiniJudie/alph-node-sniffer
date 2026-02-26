@@ -20,9 +20,12 @@ import time
 import hashlib
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# Cached clientId from reference node (per network_id), so we only fetch once per process.
+_reference_client_id_cache: Dict[int, str] = {}
 
 # Discovery version used by the network (Alephium CurrentDiscoveryVersion = Bytes.toIntUnsafe(ByteString(0,1,0,0)) = 65536)
 CURRENT_DISCOVERY_VERSION = 65536
@@ -462,18 +465,25 @@ def _get_client_id_from_reference_nodes(
 ) -> Optional[str]:
     """
     Connect to the first available reference node's broker, read Hello, return its clientId.
+    Uses in-memory cache per network_id so we only fetch once; subsequent calls return the cached value.
     reference_nodes: list of (host, discovery_port). reference_broker_port: broker port to use (or use discovery port per node).
     """
+    cached = _reference_client_id_cache.get(network_id)
+    if cached is not None:
+        logger.debug("Using cached reference clientId for network_id=%s", network_id)
+        return cached
     for ref_host, ref_port in reference_nodes:
         port = reference_broker_port if reference_broker_port is not None else ref_port
         logger.info("Getting clientId from reference node %s:%s ...", ref_host, port)
         cid = fetch_client_version_tcp(ref_host, port, network_id, timeout)
         if cid and "/" in cid:
             logger.info("Using clientId from reference: %s", cid)
+            _reference_client_id_cache[network_id] = cid
             return cid
         logger.info("Reference %s:%s did not respond or invalid clientId", ref_host, port)
-    logger.info("No reference node responded; using fallback clientId")
-    return None
+    logger.info("No reference node responded; using fallback clientId for rest of this run")
+    _reference_client_id_cache[network_id] = BROKER_HELLO_CLIENT_ID_FALLBACK
+    return BROKER_HELLO_CLIENT_ID_FALLBACK
 
 
 def fetch_chain_state_tcp(
