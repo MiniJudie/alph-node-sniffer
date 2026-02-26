@@ -428,14 +428,24 @@ async def fetch_self_clique(
     return None
 
 
+@dataclass
+class InterCliquePeerInfo:
+    """One peer from GET /infos/inter-clique-peer-info."""
+    address: str
+    port: int
+    clique_id: Optional[str] = None  # hex string
+    is_synced: bool = False
+    client_version: Optional[str] = None  # e.g. scala-alephium/v1.0.0/Linux
+
+
 async def fetch_inter_clique_peer_info(
     host: str,
     port: int,
     timeout: float = 3.0,
-) -> Optional[List[str]]:
+) -> Optional[List[InterCliquePeerInfo]]:
     """
     GET /infos/inter-clique-peer-info on node. Tries port, then 80, then 443.
-    Returns list of peer addresses (IP/hostname strings) or None on failure.
+    Returns list of InterCliquePeerInfo (address, port, clique_id, is_synced, client_version) or None on failure.
     """
     ports_to_try = [port]
     if 80 not in ports_to_try:
@@ -453,7 +463,7 @@ async def fetch_inter_clique_peer_info(
                 data = r.json()
                 if not isinstance(data, list):
                     continue
-                addresses: List[str] = []
+                result: List[InterCliquePeerInfo] = []
                 for item in data:
                     if not isinstance(item, dict):
                         continue
@@ -463,8 +473,31 @@ async def fetch_inter_clique_peer_info(
                     addr = addr_obj.get("addr")
                     if not isinstance(addr, str) or not addr.strip():
                         continue
-                    addresses.append(addr.strip())
-                return addresses
+                    addr = addr.strip()
+                    port_val = addr_obj.get("port")
+                    if isinstance(port_val, (int, float)):
+                        peer_port = int(port_val)
+                    else:
+                        peer_port = 9973
+                    clique_id: Optional[str] = None
+                    cid = item.get("cliqueId")
+                    if isinstance(cid, str) and cid.strip():
+                        clique_id = cid.strip()
+                    is_synced = bool(item.get("isSynced", False))
+                    client_version: Optional[str] = None
+                    cv = item.get("clientVersion")
+                    if isinstance(cv, str) and cv.strip():
+                        client_version = cv.strip()
+                    result.append(
+                        InterCliquePeerInfo(
+                            address=addr,
+                            port=peer_port,
+                            clique_id=clique_id,
+                            is_synced=is_synced,
+                            client_version=client_version,
+                        )
+                    )
+                return result
         except Exception as e:
             logger.debug("fetch_inter_clique_peer_info %s:%s %s", host, p, e)
     return None

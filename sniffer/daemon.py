@@ -60,6 +60,7 @@ from sniffer.version_check import (
     fetch_self_clique,
     get_chain_state_tcp,
     get_client_version_tcp,
+    InterCliquePeerInfo,
     parse_client_id,
     try_rest_with_301_and_cert,
 )
@@ -539,14 +540,25 @@ async def _phase4_neighbors(
                 try:
                     inter_peers = await fetch_inter_clique_peer_info(host, rest_port, timeout=3.0)
                     if inter_peers:
-                        for addr_str in inter_peers:
-                            if ":" in addr_str:
-                                part = addr_str.rsplit(":", 1)
-                                h, p = part[0].strip(), int(part[1])
-                            else:
-                                h, p = addr_str.strip(), 9973
-                            await add_node_if_new(h, p)
-                        logger.info("Phase 4 [%d/%d] REST inter-clique from %s: %d peers %s", i + 1, len(nodes), display, len(inter_peers), inter_peers[:10])
+                        for peer in inter_peers:
+                            await add_node_if_new(peer.address, peer.port)
+                            # Update clique info, isSynced, and clientVersion (client, version, os) for this peer
+                            kw: Dict[str, Any] = {}
+                            if peer.clique_id and peer.clique_id.strip():
+                                kw["clique_id"] = peer.clique_id.strip()
+                            kw["synced"] = peer.is_synced
+                            if peer.client_version and peer.client_version.strip():
+                                parsed = parse_client_id(peer.client_version.strip())
+                                if parsed:
+                                    if parsed.version and str(parsed.version).strip():
+                                        kw["version"] = str(parsed.version).strip()
+                                    if parsed.client:
+                                        kw["client"] = parsed.client
+                                    if parsed.os:
+                                        kw["os"] = parsed.os
+                            if kw:
+                                await update_node_enrichment(db_path, peer.address, peer.port, **kw)
+                        logger.info("Phase 4 [%d/%d] REST inter-clique from %s: %d peers %s", i + 1, len(nodes), display, len(inter_peers), [(p.address, p.port) for p in inter_peers[:10]])
                 except Exception:
                     pass
                 try:
